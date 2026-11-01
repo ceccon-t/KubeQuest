@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "A desktop game that teaches Kubernetes by having you run a (simulated) production cluster with real kubectl commands.",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "main": "dist/desktop/main.cjs",
   "engines": {
