@@ -2,8 +2,9 @@
 import { stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const home = os.homedir();
 const suspects = [
   ['~/.cache/electron', path.join(home, '.cache', 'electron')],

@@ -2,8 +2,9 @@
 import { build } from 'esbuild';
 import { mkdir, copyFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dist = path.join(root, 'dist');
 await mkdir(path.join(dist, 'web'), { recursive: true });
 await mkdir(path.join(dist, 'desktop'), { recursive: true });

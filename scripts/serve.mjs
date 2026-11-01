@@ -2,9 +2,10 @@
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'dist', 'web');
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'web');
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.map': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png' };
 const port = parseInt(process.env.PORT ?? '0', 10);
 const server = http.createServer(async (req, res) => {

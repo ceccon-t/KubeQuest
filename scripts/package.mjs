@@ -8,10 +8,11 @@
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const builderCli = require.resolve('electron-builder/out/cli/cli.js');
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const result = spawnSync(
   process.execPath,
