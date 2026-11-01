@@ -7,6 +7,7 @@ const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 const home = os.homedir();
 const suspects = [
   ['~/.cache/electron', path.join(home, '.cache', 'electron')],
+  ['~/.cache/electron-builder', path.join(home, '.cache', 'electron-builder')],
   ['~/.config/kubequest', path.join(home, '.config', 'kubequest')],
   ['~/.config/Kubequest', path.join(home, '.config', 'Kubequest')],
   ['~/Library/Application Support/kubequest', path.join(home, 'Library', 'Application Support', 'kubequest')],

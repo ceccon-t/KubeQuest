@@ -1,16 +1,20 @@
-/** Electron main process: portable mode (all state inside the app folder), one window, no remote content. */
+/** Electron main process: one window, no remote content. From source it runs in portable mode (all state inside the app folder). */
 import { app, BrowserWindow, ipcMain, shell } from 'electron';
 import path from 'node:path';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 
 const appRoot = path.resolve(__dirname, '..', '..');
-const dataDir = path.join(appRoot, 'data');
+// From source (npm start): portable — everything lives under <repo>/data, never in the OS profile (AGENTS.md §1.3).
+// Installed (AppImage, deb, NSIS, dmg): the app folder is read-only (asar, /opt, AppImage mount, Program Files),
+// so player data goes to Electron's standard per-user data directory instead (e.g. ~/.config/kubequest).
+const dataDir = app.isPackaged ? app.getPath('userData') : path.join(appRoot, 'data');
 
-// Portable: Electron's own caches/user data live under <app>/data, never in the OS profile.
-app.setPath('userData', path.join(dataDir, 'electron'));
-app.setPath('sessionData', path.join(dataDir, 'electron'));
-app.setPath('logs', path.join(dataDir, 'logs'));
-app.setPath('crashDumps', path.join(dataDir, 'crashes'));
+if (!app.isPackaged) {
+  app.setPath('userData', path.join(dataDir, 'electron'));
+  app.setPath('sessionData', path.join(dataDir, 'electron'));
+  app.setPath('logs', path.join(dataDir, 'logs'));
+  app.setPath('crashDumps', path.join(dataDir, 'crashes'));
+}
 
 function safeKey(key: string): string {
   return key.replace(/[^a-zA-Z0-9_-]/g, '_');

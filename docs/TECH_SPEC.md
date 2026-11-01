@@ -13,12 +13,12 @@
 | Cluster backend | **In-process simulated Kubernetes** (own control plane written in TypeScript) | Zero setup, zero footprint, deterministic, instant, animatable, offline. Behaviour is specified against real K8s semantics (§5). | kind/minikube/k3d (needs Docker, GBs of images, pollutes host, not deterministic); remote sandbox (needs network/accounts) |
 | Language | **TypeScript (strict)**, ES2022 modules | One language for engine, UI and shell; Node 24 runs `.ts` natively for tests (no transpiler in the test path) | Go+webview (needs cgo/webkit), Rust/Tauri (toolchain not available, heavier dev deps) |
 | UI | **Vanilla DOM + Canvas 2D**, no framework | Minimal deps, full control over animation, tiny bundle | React/Phaser (deps, bundle size, no real need) |
-| Desktop shell | **Electron** in *portable mode* (userData redirected into the app folder) | Cross-platform desktop windows with one dev dependency; web fallback is free | Tauri (Rust), NW.js, native |
+| Desktop shell | **Electron**, *portable mode* when run from source (userData redirected into the app folder); standard per-user `userData` when installed | Cross-platform desktop windows with one dev dependency; web fallback is free | Tauri (Rust), NW.js, native |
 | Fallback | `npm run web`: Node's built-in `http` serves `dist/web`, opens default browser | Works with zero native deps; also used for CI smoke tests | — |
 | Build | **esbuild** (bundle UI + Electron main), **tsc --noEmit** (type check) | Fast, single binary, no config sprawl | webpack/vite (heavier) |
 | Tests | **`node --test`** on `.ts` sources directly | No test framework dep | vitest/jest |
 | Runtime deps | **Zero.** Own YAML parser/emitter, own arg parser, own jsonpath subset | PRD "minimal dependencies"; everything auditable | js-yaml, yargs |
-| Dev deps | `typescript`, `esbuild`, `electron` (+ optional `@electron/packager` for release archives) | Three packages, all local to project | — |
+| Dev deps | `typescript`, `esbuild`, `electron`, `electron-builder` (installers: AppImage/deb, NSIS, dmg) | All local to project; electron-builder is the only cross-platform installer toolchain that needs no native deps of its own and is already proven in the sibling project Sway The People! | `@electron/packager` (zip only, no installers) |
 | Persistence | JSON file under `<app>/data/` (Electron) / `localStorage` (browser), behind a `Storage` interface | Delete folder = clean uninstall | OS app-data dirs |
 
 Development hygiene (host constraints): `npm_config_cache` and `ELECTRON_CACHE` point to `./.cache/` so no bytes land outside the project folder. See `AGENTS.md`.
@@ -258,8 +258,12 @@ interface Mission {
   `dist/web/index.html`; CSP; no remote content; `contextIsolation: true`.
 - `preload.ts`: exposes `storage.read/write(key)` over IPC (files under `data/`).
 - Browser fallback uses `localStorage` with the same interface.
-- Packaging (post-MVP): `@electron/packager` → zip per OS; app runs from the extracted
-  folder; "uninstall" = delete folder.
+- Packaging: `electron-builder` (`electron-builder.yml`, `scripts/package.mjs`) → Linux
+  AppImage + deb, Windows NSIS, macOS dmg (arm64 + x64, unsigned). `files: dist/**` only.
+  `app.isPackaged` switches `dataDir` to Electron's standard `userData`, because installed
+  apps cannot write next to themselves. Linux builds get a launcher (`scripts/after-pack.cjs`)
+  that falls back to `--no-sandbox` only when no Chromium sandbox is usable; the deb's
+  `postinst` makes `chrome-sandbox` SUID so installs stay sandboxed.
 
 ## 7. Build & tooling
 ```
@@ -269,9 +273,11 @@ npm run web        # build + serve dist/web on 127.0.0.1 + open browser
 npm test           # node --test tests/**/*.test.ts
 npm run typecheck  # tsc --noEmit
 npm run check      # typecheck + test (CI gate)
+npm run build:linux|build:win|build:mac   # electron-builder → release/ (each on its own OS)
 ```
-`.cache/` (npm + electron caches) and `dist/`, `node_modules/`, `data/` are
-git-ignored and live inside the project folder.
+`.cache/` (npm, electron and electron-builder caches) and `dist/`, `release/`, `node_modules/`,
+`data/` are git-ignored and live inside the project folder. `.github/workflows/build.yml`
+builds all three platforms on native runners and drafts a release on `v*` tags.
 
 ## 8. Testing strategy
 1. **Unit:** YAML parser/emitter round-trips; arg parser; `HumanDuration`; printers

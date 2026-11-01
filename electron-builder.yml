@@ -1,0 +1,40 @@
+appId: dev.kubequest.app
+productName: Kubequest
+directories:
+  # dist/ is esbuild's output (the app itself); packages go to release/ (git-ignored).
+  output: release
+  # Drop build/icon.png (512×512) here to brand the app; without it electron-builder uses Electron's default icon.
+  buildResources: build
+files:
+  - dist/**
+npmRebuild: false
+# Linux sandbox fallback launcher — see the hook's header comment.
+afterPack: scripts/after-pack.cjs
+# Predictable artifact names so CI upload steps can glob them.
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Game
+  maintainer: Tiago Ceccon <ceccon.t@hotmail.com>
+deb:
+  afterInstall: scripts/deb/postinst.sh
+  afterRemove: scripts/deb/postrm.sh
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+mac:
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+  category: public.app-category.games
+  # No signing certificate yet; produce unsigned builds deterministically.
+  identity: null

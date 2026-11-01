@@ -2,6 +2,7 @@
   "name": "kubequest",
   "version": "0.1.0",
   "description": "A desktop game that teaches Kubernetes by having you run a (simulated) production cluster with real kubectl commands.",
+  "author": "Tiago Ceccon <ceccon.t@hotmail.com>",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -11,6 +12,9 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "build:linux": "npm run build && node scripts/package.mjs --linux",
+    "build:win": "npm run build && node scripts/package.mjs --win",
+    "build:mac": "npm run build && node scripts/package.mjs --mac",
     "start": "npm run build && node scripts/start.mjs",
     "web": "npm run build && node scripts/serve.mjs",
     "test": "node --test --experimental-strip-types \"tests/**/*.test.ts\"",
@@ -21,6 +25,7 @@
   "devDependencies": {
     "@types/node": "^22.20.5",
     "electron": "^34.0.0",
+    "electron-builder": "^26.18.0",
     "esbuild": "^0.25.0",
     "typescript": "^5.7.0"
   }

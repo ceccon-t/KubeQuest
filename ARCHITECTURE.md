@@ -89,10 +89,15 @@ tiles by status, packet flights, warning ticker) · `panels.ts` (top bar, side t
 Styles: `web/styles.css` (CSS variables; status colours always paired with glyphs/text).
 
 ## 6. Desktop (`src/desktop`) and build
-`main.ts` sets all Electron paths under `<app>/data` (portable), single window, CSP, sandboxed
-renderer, IPC `storage:read/write` to `data/*.json`. `preload.ts` exposes `window.kubequest`.
+`main.ts` sets all Electron paths under `<app>/data` (portable) when run from source and uses
+the standard `userData` dir when `app.isPackaged`; single window, CSP, sandboxed renderer, IPC
+`storage:read/write` to `<dataDir>/*.json`. `preload.ts` exposes `window.kubequest`.
 `scripts/build.mjs` (esbuild: `dist/web/app.js`, `dist/desktop/*.cjs`), `scripts/serve.mjs`
 (browser fallback), `scripts/footprint.mjs` (host hygiene check).
+Packaging: `electron-builder.yml` + `scripts/package.mjs` (cache in `.cache/electron-builder`,
+output in `release/`), `scripts/after-pack.cjs` (Linux sandbox-fallback launcher),
+`scripts/deb/{postinst,postrm}.sh` (deb hooks), `.github/workflows/build.yml` (native-runner
+builds for Linux/Windows/macOS, draft release on `v*` tags).
 
 ## 7. Tests (`tests/`)
 `engine/yaml.test.ts`, `engine/controllers.test.ts` (scenario tests with `engine.advance`),

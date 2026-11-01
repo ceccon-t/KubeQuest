@@ -77,10 +77,30 @@ Open a ticket directly while developing: `npm run web` then
 Read `AGENTS.md` (working agreement) and `ARCHITECTURE.md` (module map) before changing code.
 Product and design documents: `docs/PRD.md`, `docs/TECH_SPEC.md`, `docs/MVP_SCOPE.md`.
 
-### Packaging (optional)
-A release archive per OS can be produced with `@electron/packager` without adding runtime
-dependencies: `npx --cache .cache/npm @electron/packager . kubequest --out release/ --overwrite`.
-The result runs from the extracted folder and keeps its data inside it.
+### Packaging
+Installers are built with `electron-builder` (a dev dependency; the game itself still has zero
+runtime dependencies). Each platform builds on its own OS:
+
+```bash
+npm run build:linux  # AppImage + deb into release/
+npm run build:win    # Windows NSIS installer (run on Windows)
+npm run build:mac    # macOS dmg, arm64 + x64 (run on macOS)
+```
+
+CI (`.github/workflows/build.yml`) builds all three platforms on native runners: manually via
+_Run workflow_ (`gh workflow run build.yml`), or by pushing a `v*` tag, which also drafts a
+GitHub release with the artifacts. electron-builder's cache stays in `./.cache/electron-builder`.
+
+Linux packages ship a launcher (`scripts/after-pack.cjs`) that keeps Chromium's sandbox when the
+system supports one (SUID helper or unprivileged user namespaces) and otherwise falls back to
+`--no-sandbox` — without it, AppImages abort on distros that restrict user namespaces
+(Ubuntu 23.10+).
+
+An installed app cannot write next to itself (asar, `/opt`, AppImage mount, Program Files), so
+it keeps progress in Electron's standard per-user data directory (`~/.config/kubequest` on
+Linux, `~/Library/Application Support/kubequest` on macOS, `%APPDATA%\kubequest` on Windows).
+Running from source (`npm start`) stays fully portable as described above. To brand the
+installers, add a 512×512 `build/icon.png`; until then they use Electron's default icon.
 
 ## License
 MIT — see `LICENSE`.
