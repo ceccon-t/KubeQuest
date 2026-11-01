@@ -1,4 +1,4 @@
-# Kubequest
+# KubeQuest
 
 **A desktop game that teaches Kubernetes by putting you on call.** You get tickets — onboarding
 tasks, releases, pager-screaming incidents — and you resolve them with *real* `kubectl` commands
@@ -9,7 +9,7 @@ pods crash-loop, rollouts roll, nodes die. Score, stars and a campaign that foll
 Nothing to install besides Node.js. No Docker, no cluster, no admin rights. Delete the folder and
 the game is gone.
 
-![Kubequest](docs/screenshot.png)
+![KubeQuest](docs/screenshot.png)
 
 ## Play
 
