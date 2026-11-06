@@ -1,6 +1,6 @@
 {
   "name": "kubequest",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A desktop game that teaches Kubernetes by having you run a (simulated) production cluster with real kubectl commands.",
   "author": "Tiago Ceccon <ceccon.t@hotmail.com>",
   "private": true,
