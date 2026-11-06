@@ -83,7 +83,8 @@ port-forward, in-container shell (`ls cat env hostname nslookup curl wget exit`)
 - Progress persisted (Electron: `data/progress.json`; browser: `localStorage`).
 
 ### 2.6 UI
-Top bar, cluster map (nodes, pods, workload groups, services, animated traffic,
+Top bar, app version under the KUBEQUEST title on every screen (from package.json: live in
+development, baked in at build time when packaged), cluster map (nodes, pods, workload groups, services, animated traffic,
 event toasts), side panel (Ticket / Objectives / Concepts / Hints), terminal with
 history and Tab completion, YAML editor, settings (sound off by default in MVP,
 reduced motion, font size).

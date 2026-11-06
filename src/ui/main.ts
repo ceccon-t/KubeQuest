@@ -2,6 +2,7 @@
 import { MissionRuntime, type RuntimeEvent } from '../game/runtime.ts';
 import { Progress } from '../game/progress.ts';
 import { detectStorage } from '../game/storage.ts';
+import { resolveVersion, BUILD_VERSION } from '../game/version.ts';
 import type { Mission } from '../game/mission.ts';
 import { MISSIONS } from '../missions/index.ts';
 import { SANDBOX } from '../missions/sandbox.ts';
@@ -18,6 +19,7 @@ class App {
   root: HTMLElement;
   progress = new Progress(detectStorage());
   rt: MissionRuntime | null = null;
+  version = BUILD_VERSION;
   terminal: Terminal;
   map: ClusterMap;
   top: TopBar;
@@ -39,7 +41,8 @@ class App {
   }
 
   async start(): Promise<void> {
-    await this.progress.load();
+    [this.version] = await Promise.all([resolveVersion(), this.progress.load()]);
+    this.top.setVersion(this.version);
     this.applySettings();
     // Dev/demo deep link: ?mission=3.2&script=kubectl get pods;kubectl get nodes  (skips the briefing)
     const params = new URLSearchParams(location.search);
@@ -70,7 +73,7 @@ class App {
     this.rt = null;
     this.map.setRuntime(null);
     clear(this.root);
-    this.root.append(campaignScreen(this.progress, { onPlay: (m) => this.play(m), onSettings: () => this.openSettings() }));
+    this.root.append(campaignScreen(this.progress, { version: this.version, onPlay: (m) => this.play(m), onSettings: () => this.openSettings() }));
   }
 
   togglePause(): void {

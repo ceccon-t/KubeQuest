@@ -34,6 +34,11 @@ h1, h2, h3 { margin: 0 0 .4em; font-weight: 650; }
 .terminal { grid-area: term; }
 .topbar { display: flex; align-items: center; gap: 14px; padding: 0 14px; background: var(--bg-2); border-bottom: 1px solid var(--line); }
 .topbar .logo { font-weight: 800; letter-spacing: .12em; color: var(--accent); font-size: 14px; }
+/* Title + version stacked; the version sits right beneath the wordmark on every screen. */
+.brand { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.15; }
+.brand h1, .brand .logo { margin: 0; }
+.brand .version { font-family: var(--mono); font-size: 10.5px; color: var(--muted); letter-spacing: 0; white-space: nowrap; }
+.brand .version:empty { display: none; }
 .topbar .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .topbar .spacer { flex: 1; }
 .stat { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.1; min-width: 70px; }

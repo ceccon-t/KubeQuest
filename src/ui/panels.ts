@@ -2,10 +2,12 @@
 import type { MissionRuntime } from '../game/runtime.ts';
 import type { Mission } from '../game/mission.ts';
 import { h, clear, mdLite, fmtTime } from './dom.ts';
+import { brand } from './screens.ts';
 
 export class TopBar {
   el: HTMLElement;
   private title: HTMLElement;
+  private brandEl: HTMLElement;
   private timer: HTMLElement;
   private sloVal: HTMLElement;
   private sloBar: HTMLElement;
@@ -21,8 +23,9 @@ export class TopBar {
     this.hintBtn = h('button', { onclick: opts.onHint, title: 'Reveal the next hint (costs score)' }, '💡 Hint');
     this.pauseBtn = h('button', { onclick: opts.onPause, title: 'Pause / resume the whole simulation', 'aria-pressed': 'false' }, '⏸ Pause');
     const restartBtn = h('button', { onclick: opts.onRestart, title: 'Restart this ticket from its initial state' }, '↺ Restart');
+    this.brandEl = brand(h('div', { class: 'logo' }, 'KUBEQUEST'), '');
     this.el = h('header', { class: 'topbar' },
-      h('div', { class: 'logo' }, 'KUBEQUEST'),
+      this.brandEl,
       this.title,
       h('div', { class: 'spacer' }),
       h('div', { class: 'stat' }, h('div', { class: 'label' }, 'Elapsed'), this.timer),
@@ -34,6 +37,10 @@ export class TopBar {
       h('button', { class: 'ghost', onclick: opts.onSettings, title: 'Settings' }, '⚙'),
       h('button', { class: 'ghost', onclick: opts.onMenu }, 'Campaign'),
     );
+  }
+  setVersion(version: string): void {
+    const v = this.brandEl.querySelector('.version');
+    if (v) v.textContent = version ? `v${version}` : '';
   }
   setMission(m: Mission): void {
     clear(this.title);

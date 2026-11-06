@@ -4,6 +4,7 @@ import path from 'node:path';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 
 const appRoot = path.resolve(__dirname, '..', '..');
+declare const __KQ_VERSION__: string | undefined; // injected by scripts/build.mjs
 // From source (npm start): portable — everything lives under <repo>/data, never in the OS profile (AGENTS.md §1.3).
 // Installed (AppImage, deb, NSIS, dmg): the app folder is read-only (asar, /opt, AppImage mount, Program Files),
 // so player data goes to Electron's standard per-user data directory instead (e.g. ~/.config/kubequest).
@@ -52,6 +53,18 @@ async function createWindow(): Promise<void> {
     }, 4000);
   }
 }
+
+// Version source is always package.json: packaged builds report the version baked in at build time
+// (`__KQ_VERSION__`, see scripts/build.mjs); from source it is re-read on every request so edits show up live.
+ipcMain.handle('app:version', async (): Promise<string> => {
+  const built = typeof __KQ_VERSION__ === 'string' ? __KQ_VERSION__ : app.getVersion();
+  if (app.isPackaged) return built;
+  try {
+    const pkg: unknown = JSON.parse(await readFile(path.join(appRoot, 'package.json'), 'utf8'));
+    if (typeof pkg === 'object' && pkg !== null && 'version' in pkg && typeof pkg.version === 'string') return pkg.version;
+  } catch { /* unreadable package.json: fall back to the built version */ }
+  return built;
+});
 
 ipcMain.handle('storage:read', async (_e, key: string) => {
   try {

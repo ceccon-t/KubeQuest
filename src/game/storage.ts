@@ -31,6 +31,8 @@ export class LocalStorage implements Storage {
 export interface DesktopBridge {
   storage: { read(key: string): Promise<string | null>; write(key: string, value: string): Promise<void> };
   platform: string;
+  /** Version of package.json: live in development, baked in when packaged (see `game/version.ts`). */
+  version?: () => Promise<string>;
 }
 
 /** Storage backed by the Electron preload bridge when present. */

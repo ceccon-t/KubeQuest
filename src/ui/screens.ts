@@ -12,13 +12,18 @@ export function toast(text: string, kind: 'ok' | 'warn' | '' = ''): void {
   setTimeout(() => t.remove(), 3200);
 }
 
-export function campaignScreen(progress: Progress, opts: { onPlay: (m: Mission) => void; onSettings: () => void }): HTMLElement {
+/** Title with the app version right beneath it; shared by the campaign header and the in-game top bar. */
+export function brand(title: HTMLElement, version: string): HTMLElement {
+  return h('div', { class: 'brand' }, title, h('div', { class: 'version', title: 'Kubequest version (from package.json)' }, version ? `v${version}` : ''));
+}
+
+export function campaignScreen(progress: Progress, opts: { version: string; onPlay: (m: Mission) => void; onSettings: () => void }): HTMLElement {
   const starsOf: Record<string, number> = {};
   for (const [id, r] of Object.entries(progress.data.missions)) starsOf[id] = r.stars;
   const total = Object.values(starsOf).reduce((n, s) => n + s, 0);
   const unlockAll = progress.data.settings.unlockAll;
   const el = h('div', { class: 'campaign' },
-    h('header', null, h('h1', null, 'KUBEQUEST'), h('span', { class: 'muted' }, 'On-call at Orbital Logistics · real kubectl, simulated cluster'), h('div', { style: { flex: '1' } }), h('span', { class: 'muted' }, `★ ${total}`), h('button', { onclick: opts.onSettings }, '⚙ Settings')),
+    h('header', null, brand(h('h1', null, 'KUBEQUEST'), opts.version), h('span', { class: 'muted' }, 'On-call at Orbital Logistics · real kubectl, simulated cluster'), h('div', { style: { flex: '1' } }), h('span', { class: 'muted' }, `★ ${total}`), h('button', { onclick: opts.onSettings }, '⚙ Settings')),
   );
   for (const ch of CHAPTERS) {
     const grid = h('div', { class: 'missions' });

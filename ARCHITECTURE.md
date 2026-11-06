@@ -69,6 +69,9 @@ Commands live in `commands/`: `get`, `describe`, `apply` (+`create`, `edit`), `i
   built from the same `Mission` (setup is deterministic by seed).
 - `scoring.ts` — score weights and star thresholds (see TECH_SPEC §4.2).
 - `progress.ts` + `storage.ts` — versioned player data behind a `Storage` interface
+- `version.ts` — app version for the UI (`resolveVersion`): package.json read live in development
+  (Electron `app:version` IPC, or `version.json` from `scripts/serve.mjs`), build-time `__KQ_VERSION__`
+  (esbuild `define`, declared in `build-globals.d.ts`) in packaged builds and static hosting
   (`BridgeStorage` for Electron IPC, `LocalStorage` for browsers, `MemoryStorage` for tests).
 
 ## 4. Missions (`src/missions`)
@@ -91,9 +94,10 @@ Styles: `web/styles.css` (CSS variables; status colours always paired with glyph
 ## 6. Desktop (`src/desktop`) and build
 `main.ts` sets all Electron paths under `<app>/data` (portable) when run from source and uses
 the standard `userData` dir when `app.isPackaged`; single window, CSP, sandboxed renderer, IPC
-`storage:read/write` to `<dataDir>/*.json`. `preload.ts` exposes `window.kubequest`.
-`scripts/build.mjs` (esbuild: `dist/web/app.js`, `dist/desktop/*.cjs`), `scripts/serve.mjs`
-(browser fallback), `scripts/footprint.mjs` (host hygiene check).
+`storage:read/write` to `<dataDir>/*.json`, `app:version` (live package.json from source, build-time
+version when packaged). `preload.ts` exposes `window.kubequest` (`storage`, `platform`, `version`).
+`scripts/build.mjs` (esbuild: `dist/web/app.js`, `dist/desktop/*.cjs`; injects `__KQ_VERSION__`
+from package.json), `scripts/serve.mjs` (browser fallback; serves `/version.json` live), `scripts/footprint.mjs` (host hygiene check).
 Packaging: `electron-builder.yml` + `scripts/package.mjs` (cache in `.cache/electron-builder`,
 output in `release/`), `scripts/after-pack.cjs` (Linux sandbox-fallback launcher),
 `scripts/deb/{postinst,postrm}.sh` (deb hooks), `.github/workflows/build.yml` (native-runner

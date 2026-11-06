@@ -5,13 +5,23 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'web');
+const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const root = path.join(project, 'dist', 'web');
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.map': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png' };
 const port = parseInt(process.env.PORT ?? '0', 10);
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   const file = path.join(root, url.pathname === '/' ? 'index.html' : url.pathname);
   if (!file.startsWith(root)) { res.writeHead(403); res.end(); return; }
+  if (url.pathname === '/version.json') {
+    // Development: the UI shows the *current* package.json version, not the one baked into the bundle.
+    try {
+      const { version } = JSON.parse(await readFile(path.join(project, 'package.json'), 'utf8'));
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ version }));
+    } catch { res.writeHead(500); res.end(); }
+    return;
+  }
   try {
     const data = await readFile(file);
     res.writeHead(200, { 'content-type': types[path.extname(file)] ?? 'application/octet-stream', 'cache-control': 'no-store' });
