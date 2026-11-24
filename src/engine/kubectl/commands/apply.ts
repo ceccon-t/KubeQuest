@@ -13,6 +13,12 @@ import { parseResourceArgs, fetch } from '../resources.ts';
 import { sortKeys } from '../../yaml.ts';
 import { normalizeImage } from '../../images.ts';
 import { parseCron } from '../../controllers/job.ts';
+import { apiCreate, apiReplace, formatApiError, warningChunks, access } from '../api.ts';
+import { crdFor, validateCustomResource } from '../../controllers/crd.ts';
+import type { CustomResourceDefinition } from '../../types.ts';
+import { generate, generateSecret, keyValueSources, jobFromCronJob, GENERATOR_FLAGS } from './generators.ts';
+import { kustomizeBuild, KustomizeError } from '../../kustomize.ts';
+import { b64encode } from '../../encoding.ts';
 
 export const LAST_APPLIED = 'kubectl.kubernetes.io/last-applied-configuration';
 
@@ -77,6 +83,16 @@ export function admit(engine: Engine, m: Manifest, ns: string, nsExplicit: boole
     obj.metadata.namespace = obj.metadata.namespace ?? ns;
   } else delete obj.metadata.namespace;
   validateObject(obj, existing);
+  if (kind === 'CustomResourceDefinition') {
+    const c = obj as unknown as CustomResourceDefinition;
+    const want = `${c.spec?.names?.plural ?? ''}.${c.spec?.group ?? ''}`;
+    if (obj.metadata.name !== want) throw new ValidationError(`CustomResourceDefinition.apiextensions.k8s.io "${obj.metadata.name}" is invalid: metadata.name: Invalid value: "${obj.metadata.name}": must be spec.names.plural+"."+spec.group`);
+  }
+  const crd = r && engine.crdResources.includes(r) ? crdFor(engine, kind, obj.apiVersion) : undefined;
+  if (crd) {
+    try { validateCustomResource(crd, obj); }
+    catch (e) { if (e instanceof ApiError) throw new KubectlError(formatApiError(e, m.source === 'edit' ? undefined : m.source)); throw e; }
+  }
   if (r?.namespaced && !engine.store.get('Namespace', undefined, obj.metadata.namespace as string)) {
     throw new KubectlError(`Error from server (NotFound): error when creating "${m.source}": namespaces "${obj.metadata.namespace}" not found`);
   }
@@ -107,7 +123,8 @@ function stripForLastApplied(obj: KubeObject): KubeObject {
 }
 
 /** Create or update (apply semantics). Returns the action taken. */
-export function applyOne(engine: Engine, m: Manifest, ns: string, nsExplicit: boolean, dryRun: boolean): { obj: KubeObject; action: 'created' | 'configured' | 'unchanged' } {
+export function applyOne(ctx: CommandContext, m: Manifest, dryRun: boolean): { obj: KubeObject; action: 'created' | 'configured' | 'unchanged'; warnings: string[] } {
+  const engine = ctx.engine, ns = ctx.namespace, nsExplicit = ctx.namespaceExplicit;
   const { kind } = resolveKind(m.obj, m.source);
   const r = resourceByKind(kind);
   const name = m.obj.metadata?.name;
@@ -117,11 +134,11 @@ export function applyOne(engine: Engine, m: Manifest, ns: string, nsExplicit: bo
   if (!existing) {
     const obj = admit(engine, m, ns, nsExplicit);
     obj.metadata.annotations = { ...(obj.metadata.annotations ?? {}), [LAST_APPLIED]: lastApplied + '\n' };
-    if (!dryRun) engine.store.create(obj);
-    return { obj, action: 'created' };
+    const warnings = dryRun ? [] : apiCreate(ctx, obj);
+    return { obj, action: 'created', warnings };
   }
   const prevApplied = existing.metadata.annotations?.[LAST_APPLIED]?.trim();
-  if (prevApplied === lastApplied) return { obj: existing, action: 'unchanged' };
+  if (prevApplied === lastApplied) return { obj: existing, action: 'unchanged', warnings: [] };
   const incoming = admit(engine, m, ns, nsExplicit, existing);
   // three-way-ish merge: fields in the manifest win; fields previously applied but now absent are dropped; others kept
   const merged = structuredClone(existing);
@@ -146,11 +163,12 @@ export function applyOne(engine: Engine, m: Manifest, ns: string, nsExplicit: bo
   }
   if (merged.metadata.labels === undefined) delete merged.metadata.labels;
   const specChanged = JSON.stringify(sortKeys(merged.spec)) !== JSON.stringify(sortKeys(existing.spec)) || JSON.stringify(merged.data) !== JSON.stringify(existing.data);
+  let warnings: string[] = [];
   if (!dryRun) {
     applyDefaults(merged, engine);
-    engine.store.update(merged, { specChanged });
+    warnings = apiReplace(ctx, merged, existing, { specChanged });
   }
-  return { obj: merged, action: 'configured' };
+  return { obj: merged, action: 'configured', warnings };
 }
 
 function dryRunFlag(ctx: CommandContext): 'none' | 'client' | 'server' {
@@ -180,16 +198,26 @@ export const applyCommand: KubectlCommand = {
     { name: 'wait', type: 'bool' },
   ],
   run: async function* (ctx: CommandContext): AsyncGenerator<OutputChunk, number> {
-    if (str(ctx.args, 'kustomize')) throw new KubectlError('kubequest: `apply -k` (kustomize) is not supported in the simulator yet');
     if (bool(ctx.args, 'prune')) throw new KubectlError('kubequest: `apply --prune` is not supported in the simulator yet');
     if (ctx.args.positional.length) throw new KubectlError(`Unexpected args: [${ctx.args.positional.join(' ')}]`);
-    const manifests = loadManifests(ctx, strs(ctx.args, 'filename'), bool(ctx.args, 'recursive'));
+    let manifests: Manifest[];
+    const kdir = str(ctx.args, 'kustomize');
+    if (kdir !== undefined) {
+      if (strs(ctx.args, 'filename').length) throw new KubectlError('only one of -f or -k can be specified');
+      try {
+        const built = kustomizeBuild(ctx.vfs, kdir);
+        for (const w of built.warnings) yield err(w + '\n');
+        manifests = built.objects.map((obj) => ({ obj, source: kdir }));
+      } catch (e) { if (e instanceof KustomizeError) throw new KubectlError(e.message); throw e; }
+      if (!manifests.length) throw new KubectlError('no objects passed to apply');
+    } else manifests = loadManifests(ctx, strs(ctx.args, 'filename'), bool(ctx.args, 'recursive'));
     const dry = dryRunFlag(ctx);
     const fmt = parseOutputFlag(str(ctx.args, 'output'));
     let code = 0;
     for (const m of manifests) {
       try {
-        const { obj, action } = applyOne(ctx.engine, m, ctx.namespace, ctx.namespaceExplicit, dry !== 'none');
+        const { obj, action, warnings } = applyOne(ctx, m, dry !== 'none');
+        yield* warningChunks(warnings);
         if (bool(ctx.args, 'record') && !dry) {
           obj.metadata.annotations = { ...(obj.metadata.annotations ?? {}), 'kubernetes.io/change-cause': ctx.cmdline };
           ctx.engine.store.update(obj);
@@ -198,7 +226,8 @@ export const applyCommand: KubectlCommand = {
         else yield out(renderObjects(fmt, [obj], true));
       } catch (e) {
         if (e instanceof ValidationError) { yield err(`The ${e.message}\n`); code = 1; continue; }
-        if (e instanceof KubectlError) { yield err((e.message.startsWith('Error from server') ? e.message : `error: ${e.message}`) + '\n'); code = 1; continue; }
+        if (e instanceof KubectlError) { yield err((/^(Error from server|The |kubequest:)/.test(e.message) ? e.message : `error: ${e.message}`) + '\n'); code = 1; continue; }
+        if (e instanceof ApiError) { yield err(formatApiError(e, m.source, 'creating') + '\n'); code = 1; continue; }
         throw e;
       }
     }
@@ -264,6 +293,8 @@ export const createCommand: KubectlCommand = {
     { name: 'tcp', type: 'strings' },
     { name: 'type', type: 'string' },
     { name: 'from', type: 'string' },
+    { name: 'clusterip', type: 'string' },
+    ...GENERATOR_FLAGS,
   ],
   run: async function* (ctx: CommandContext): AsyncGenerator<OutputChunk, number> {
     const a = ctx.args;
@@ -277,8 +308,12 @@ export const createCommand: KubectlCommand = {
         return;
       }
       const admitted = admit(ctx.engine, { obj, source }, ctx.namespace, ctx.namespaceExplicit);
-      try { ctx.engine.store.create(admitted); }
-      catch (e) { if (e instanceof ApiError) throw new KubectlError(`Error from server (${e.reason}): error when creating "${source}": ${e.message}`); throw e; }
+      try { yield* warningChunks(apiCreate(ctx, admitted)); }
+      catch (e) {
+        // generators wrap API errors: `error: failed to create deployment: deployments.apps "web" is forbidden: …`
+        if (e instanceof ApiError) throw new KubectlError(source === 'kubectl create' ? (e.reason === 'AlreadyExists' ? `failed to create ${admitted.kind.toLowerCase()}: ${e.message}` : `failed to create ${admitted.kind.toLowerCase()}: ${e.message}`) : formatApiError(e, source));
+        throw e;
+      }
       if (fmt.kind === 'table') yield out(`${qualifiedName(admitted.kind, admitted.metadata.name)} created\n`);
       else yield out(renderObjects(fmt, [admitted], true));
     };
@@ -291,14 +326,14 @@ export const createCommand: KubectlCommand = {
           if (dry === 'none') {
             const admitted = admit(ctx.engine, m, ctx.namespace, ctx.namespaceExplicit);
             if (bool(a, 'save-config')) admitted.metadata.annotations = { ...(admitted.metadata.annotations ?? {}), [LAST_APPLIED]: JSON.stringify(sortKeys(stripForLastApplied(m.obj))) + '\n' };
-            try { ctx.engine.store.create(admitted); }
-            catch (e) { if (e instanceof ApiError) throw new KubectlError(`Error from server (${e.reason}): error when creating "${m.source}": ${e.message}`); throw e; }
+            try { yield* warningChunks(apiCreate(ctx, admitted)); }
+            catch (e) { if (e instanceof ApiError) throw new KubectlError(formatApiError(e, m.source)); throw e; }
             if (fmt.kind === 'table') yield out(`${qualifiedName(admitted.kind, admitted.metadata.name)} created\n`);
             else yield out(renderObjects(fmt, [admitted], true));
           } else yield* emit(m.obj, m.source);
         } catch (e) {
           if (e instanceof ValidationError) { yield err(`The ${e.message}\n`); code = 1; continue; }
-          if (e instanceof KubectlError) { yield err((e.message.startsWith('Error from server') ? e.message : `error: ${e.message}`) + '\n'); code = 1; continue; }
+          if (e instanceof KubectlError) { yield err((/^(Error from server|The |kubequest:)/.test(e.message) ? e.message : `error: ${e.message}`) + '\n'); code = 1; continue; }
           throw e;
         }
       }
@@ -320,24 +355,26 @@ export const createCommand: KubectlCommand = {
         break;
       }
       case 'configmap': case 'cm': {
-        if (strs(a, 'from-file').length || strs(a, 'from-env-file').length) throw new KubectlError('kubequest: --from-file/--from-env-file are not supported in the simulator yet (use --from-literal)');
-        obj = { apiVersion: 'v1', kind: 'ConfigMap', metadata: { creationTimestamp: null as unknown as string, name: need() }, data: parseKv(strs(a, 'from-literal'), 'from-literal') };
+        const data = keyValueSources(ctx);
+        obj = { apiVersion: 'v1', kind: 'ConfigMap', metadata: { creationTimestamp: null as unknown as string, name: need() }, ...(Object.keys(data).length ? { data } : {}) };
         break;
       }
       case 'secret': {
         const kind = a.positional[1];
         const sname = a.positional[2];
-        if (kind !== 'generic') throw new KubectlError(kind ? `kubequest: "create secret ${kind}" is not supported in the simulator yet` : 'You must specify the secret type (generic)');
-        if (!sname) throw new KubectlError('NAME is required');
+        if (!kind || !['generic', 'tls', 'docker-registry'].includes(kind)) throw new KubectlError(kind ? `unknown command "${kind}" for "kubectl create secret"` : 'You must specify the secret type (generic, tls or docker-registry)');
+        if (!sname || a.positional.length !== 3) throw new KubectlError(`exactly one NAME is required, got ${Math.max(0, a.positional.length - 2)}\nSee 'kubectl create secret ${kind} -h' for help and examples`);
+        const special = generateSecret(ctx, kind, sname);
+        if (special) { obj = special; break; }
         const data: Record<string, string> = {};
-        for (const [k, v] of Object.entries(parseKv(strs(a, 'from-literal'), 'from-literal'))) data[k] = typeof btoa === 'function' ? btoa(v) : Buffer.from(v).toString('base64');
-        obj = { apiVersion: 'v1', kind: 'Secret', metadata: { creationTimestamp: null as unknown as string, name: sname }, type: 'Opaque', data };
+        for (const [k, v] of Object.entries(keyValueSources(ctx))) data[k] = b64encode(v);
+        obj = { apiVersion: 'v1', kind: 'Secret', metadata: { creationTimestamp: null as unknown as string, name: sname }, ...(str(a, 'type') ? { type: str(a, 'type') } : {}), ...(Object.keys(data).length ? { data } : {}) };
         break;
       }
       case 'job': {
         const image = strs(a, 'image')[0];
         if (!image && !str(a, 'from')) throw new KubectlError('required flag(s) "image" not set');
-        if (str(a, 'from')) throw new KubectlError('kubequest: `create job --from` is not supported in the simulator yet');
+        if (str(a, 'from')) { obj = jobFromCronJob(ctx, need(), str(a, 'from') as string); break; }
         const c: Record<string, unknown> = { image, name: need(), resources: {} };
         if (a.rest.length) c.command = a.rest;
         obj = { apiVersion: 'batch/v1', kind: 'Job', metadata: { creationTimestamp: null as unknown as string, name: need() }, spec: { template: { metadata: { creationTimestamp: null }, spec: { containers: [c], restartPolicy: 'Never' } } }, status: {} };
@@ -360,12 +397,23 @@ export const createCommand: KubectlCommand = {
         if (!type || !typeMap[type]) throw new KubectlError(type ? `kubequest: "create service ${type}" is not supported in the simulator yet` : 'You must specify the service type (clusterip, nodeport, loadbalancer)');
         if (!sname) throw new KubectlError('NAME is required');
         const ports = strs(a, 'tcp').map((t) => { const [p, tp] = t.split(':'); const port = parseInt(p as string, 10); return { name: `${port}-${tp ?? port}`, port, protocol: 'TCP', targetPort: tp ? (/^\d+$/.test(tp) ? parseInt(tp, 10) : tp) : port }; });
-        if (!ports.length) throw new KubectlError('at least one tcp port specifier must be provided');
-        obj = { apiVersion: 'v1', kind: 'Service', metadata: { creationTimestamp: null as unknown as string, labels: { app: sname }, name: sname }, spec: { ports, selector: { app: sname }, type: typeMap[type] }, status: { loadBalancer: {} } };
+        const headless = str(a, 'clusterip');
+        if (!ports.length && headless !== 'None') throw new KubectlError('at least one tcp port specifier must be provided');
+        obj = { apiVersion: 'v1', kind: 'Service', metadata: { creationTimestamp: null as unknown as string, labels: { app: sname }, name: sname }, spec: { ...(headless ? { clusterIP: headless } : {}), ...(ports.length ? { ports } : {}), selector: { app: sname }, type: typeMap[type] }, status: { loadBalancer: {} } };
         break;
       }
-      default:
-        throw new KubectlError(`kubequest: "create ${sub}" is not supported in the simulator yet`);
+      case 'token': {
+        const sa = need();
+        if (!ctx.engine.store.get('ServiceAccount', ctx.namespace, sa)) throw new KubectlError(`failed to create token: serviceaccounts "${sa}" not found`);
+        // a signed JWT in reality; the simulator has no signing key, so the payload is the only meaningful part
+        yield out(`eyJhbGciOiJSUzI1NiIsImtpZCI6IkpIeTh4In0.${b64encode(JSON.stringify({ aud: ['https://kubernetes.default.svc.cluster.local'], iss: 'https://kubernetes.default.svc.cluster.local', sub: `system:serviceaccount:${ctx.namespace}:${sa}` })).replace(/=+$/, '')}.c2ltdWxhdGVkLXNpZ25hdHVyZQ\n`);
+        return 0;
+      }
+      default: {
+        const generated = generate(ctx, sub);
+        if (!generated) throw new KubectlError(`kubequest: "create ${sub}" is not supported in the simulator yet`);
+        obj = generated;
+      }
     }
     if (dry === 'none') { delete obj.metadata.creationTimestamp; }
     // upstream: an explicit --namespace is enforced on generated objects (EnforceNamespace)
@@ -392,7 +440,7 @@ export const editCommand: KubectlCommand = {
     if (strs(ctx.args, 'filename').length) throw new KubectlError('kubequest: `edit -f` is not supported in the simulator yet');
     const refs = parseResourceArgs(ctx.args.positional);
     if (refs.length !== 1 || refs[0]!.name === undefined) throw new KubectlError('kubequest: edit one resource at a time (TYPE NAME or TYPE/NAME)');
-    const obj = fetch(ctx.engine, refs[0]!, ctx.namespace, false)[0] as KubeObject;
+    const obj = fetch(ctx.engine, refs[0]!, ctx.namespace, false, undefined, undefined, access(ctx))[0] as KubeObject;
     const header = `# Please edit the object below. Lines beginning with a '#' will be ignored,\n# and an empty file will abort the edit. If an error occurs while saving this file will be\n# reopened with the relevant failures.\n#\n`;
     const text = header + stringify(sortKeys(obj) as never);
     const edited = await ctx.host.editor(text, `${obj.kind.toLowerCase()}-${obj.metadata.name}.yaml`);
@@ -418,12 +466,13 @@ export const editCommand: KubectlCommand = {
       merged.metadata.creationTimestamp = obj.metadata.creationTimestamp;
       const specChanged = JSON.stringify(sortKeys(merged.spec ?? merged.data)) !== JSON.stringify(sortKeys(obj.spec ?? obj.data)) || JSON.stringify(merged.data) !== JSON.stringify(obj.data);
       applyDefaults(merged, ctx.engine);
-      ctx.engine.store.update(merged, { specChanged });
+      yield* warningChunks(apiReplace(ctx, merged, obj, { specChanged }));
       yield out(`${qualifiedName(obj.kind, obj.metadata.name)} edited\n`);
       return 0;
     } catch (e) {
       if (e instanceof ValidationError) { yield err(`error: ${obj.kind.toLowerCase()}s "${obj.metadata.name}" could not be patched: ${e.message}\nYou can run \`kubectl replace -f /tmp/kubectl-edit.yaml\` to try this update again.\n`); return 1; }
-      if (e instanceof KubectlError) { yield err(`error: ${e.message}\n`); return 1; }
+      if (e instanceof KubectlError) { yield err((/^(Error from server|The )/.test(e.message) ? e.message : `error: ${e.message}`) + '\n'); return 1; }
+      if (e instanceof ApiError) { yield err(`error: ${resourceByKind(obj.kind)?.plural ?? obj.kind.toLowerCase()} "${obj.metadata.name}" could not be patched: ${e.message}\nYou can run \`kubectl replace -f /tmp/kubectl-edit.yaml\` to try this update again.\n`); return 1; }
       throw e;
     }
   },

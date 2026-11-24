@@ -10,6 +10,8 @@ export interface ResourceInfo {
   namespaced: boolean;
   categories: string[];
   verbs: string[];
+  /** Custom resources only: printer columns from the CRD (`additionalPrinterColumns`). */
+  columns?: { name: string; type: string; jsonPath: string; priority?: number }[];
 }
 
 const ALL_VERBS = ['create', 'delete', 'deletecollection', 'get', 'list', 'patch', 'update', 'watch'];
@@ -31,10 +33,37 @@ const RESOURCES: ResourceInfo[] = [
   { kind: 'CronJob', group: 'batch', version: 'v1', plural: 'cronjobs', singular: 'cronjob', shortNames: ['cj'], namespaced: true, categories: ['all'], verbs: ALL_VERBS },
   { kind: 'Job', group: 'batch', version: 'v1', plural: 'jobs', singular: 'job', shortNames: [], namespaced: true, categories: ['all'], verbs: ALL_VERBS },
   { kind: 'EndpointSlice', group: 'discovery.k8s.io', version: 'v1', plural: 'endpointslices', singular: 'endpointslice', shortNames: [], namespaced: true, categories: [], verbs: ALL_VERBS },
+  { kind: 'LimitRange', group: '', version: 'v1', plural: 'limitranges', singular: 'limitrange', shortNames: ['limits'], namespaced: true, categories: [], verbs: ALL_VERBS },
+  { kind: 'PersistentVolumeClaim', group: '', version: 'v1', plural: 'persistentvolumeclaims', singular: 'persistentvolumeclaim', shortNames: ['pvc'], namespaced: true, categories: [], verbs: ALL_VERBS },
+  { kind: 'PersistentVolume', group: '', version: 'v1', plural: 'persistentvolumes', singular: 'persistentvolume', shortNames: ['pv'], namespaced: false, categories: [], verbs: ALL_VERBS },
+  { kind: 'ResourceQuota', group: '', version: 'v1', plural: 'resourcequotas', singular: 'resourcequota', shortNames: ['quota'], namespaced: true, categories: [], verbs: ALL_VERBS },
+  { kind: 'ValidatingAdmissionPolicy', group: 'admissionregistration.k8s.io', version: 'v1', plural: 'validatingadmissionpolicies', singular: 'validatingadmissionpolicy', shortNames: [], namespaced: false, categories: ['api-extensions'], verbs: ALL_VERBS },
+  { kind: 'ValidatingAdmissionPolicyBinding', group: 'admissionregistration.k8s.io', version: 'v1', plural: 'validatingadmissionpolicybindings', singular: 'validatingadmissionpolicybinding', shortNames: [], namespaced: false, categories: ['api-extensions'], verbs: ALL_VERBS },
+  { kind: 'CustomResourceDefinition', group: 'apiextensions.k8s.io', version: 'v1', plural: 'customresourcedefinitions', singular: 'customresourcedefinition', shortNames: ['crd', 'crds'], namespaced: false, categories: ['api-extensions'], verbs: ALL_VERBS },
+  { kind: 'HorizontalPodAutoscaler', group: 'autoscaling', version: 'v2', plural: 'horizontalpodautoscalers', singular: 'horizontalpodautoscaler', shortNames: ['hpa'], namespaced: true, categories: ['all'], verbs: ALL_VERBS },
+  { kind: 'IngressClass', group: 'networking.k8s.io', version: 'v1', plural: 'ingressclasses', singular: 'ingressclass', shortNames: [], namespaced: false, categories: [], verbs: ALL_VERBS },
+  { kind: 'Ingress', group: 'networking.k8s.io', version: 'v1', plural: 'ingresses', singular: 'ingress', shortNames: ['ing'], namespaced: true, categories: [], verbs: ALL_VERBS },
+  { kind: 'NetworkPolicy', group: 'networking.k8s.io', version: 'v1', plural: 'networkpolicies', singular: 'networkpolicy', shortNames: ['netpol'], namespaced: true, categories: [], verbs: ALL_VERBS },
+  { kind: 'PodDisruptionBudget', group: 'policy', version: 'v1', plural: 'poddisruptionbudgets', singular: 'poddisruptionbudget', shortNames: ['pdb'], namespaced: true, categories: [], verbs: ALL_VERBS },
+  { kind: 'ClusterRoleBinding', group: 'rbac.authorization.k8s.io', version: 'v1', plural: 'clusterrolebindings', singular: 'clusterrolebinding', shortNames: [], namespaced: false, categories: [], verbs: ALL_VERBS },
+  { kind: 'ClusterRole', group: 'rbac.authorization.k8s.io', version: 'v1', plural: 'clusterroles', singular: 'clusterrole', shortNames: [], namespaced: false, categories: [], verbs: ALL_VERBS },
+  { kind: 'RoleBinding', group: 'rbac.authorization.k8s.io', version: 'v1', plural: 'rolebindings', singular: 'rolebinding', shortNames: [], namespaced: true, categories: [], verbs: ALL_VERBS },
+  { kind: 'Role', group: 'rbac.authorization.k8s.io', version: 'v1', plural: 'roles', singular: 'role', shortNames: [], namespaced: true, categories: [], verbs: ALL_VERBS },
+  { kind: 'PriorityClass', group: 'scheduling.k8s.io', version: 'v1', plural: 'priorityclasses', singular: 'priorityclass', shortNames: ['pc'], namespaced: false, categories: [], verbs: ALL_VERBS },
+  { kind: 'StorageClass', group: 'storage.k8s.io', version: 'v1', plural: 'storageclasses', singular: 'storageclass', shortNames: ['sc'], namespaced: false, categories: [], verbs: ALL_VERBS },
 ];
 
+/**
+ * Resources served through CustomResourceDefinitions. They belong to one cluster, so the Engine owns
+ * the list and points the registry at it whenever it becomes the active engine (constructor, tick, kubectl).
+ */
+let dynamic: ResourceInfo[] = [];
+export function useDynamicResources(list: ResourceInfo[]): void {
+  dynamic = list;
+}
+
 export function allResources(): ResourceInfo[] {
-  return RESOURCES;
+  return dynamic.length ? [...RESOURCES, ...dynamic] : RESOURCES;
 }
 
 export function apiVersionOf(r: ResourceInfo): string {
@@ -48,7 +77,7 @@ export function resolveResource(name: string): ResourceInfo | undefined {
   const dot = lower.indexOf('.');
   const base = dot >= 0 ? lower.slice(0, dot) : lower;
   const group = dot >= 0 ? lower.slice(dot + 1) : undefined;
-  const candidates = RESOURCES.filter(
+  const candidates = allResources().filter(
     (r) => r.plural === base || r.singular === base || r.shortNames.includes(base) || r.kind.toLowerCase() === base,
   );
   if (candidates.length === 0) return undefined;
@@ -60,7 +89,7 @@ export function resolveResource(name: string): ResourceInfo | undefined {
 }
 
 export function resourceByKind(kind: string): ResourceInfo | undefined {
-  return RESOURCES.find((r) => r.kind === kind);
+  return RESOURCES.find((r) => r.kind === kind) ?? dynamic.find((r) => r.kind === kind);
 }
 
 /** `kubectl` prints created/deleted objects as `deployment.apps/web` (core group has no suffix). */

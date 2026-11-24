@@ -1,5 +1,6 @@
 import type { Mission } from '../game/mission.ts';
 import { ORBITAL_IMAGES, REG, deployment, service, orbitalNodes, systemWorkloads } from './lib.ts';
+import { ingressNginx, storageClass } from './platform.ts';
 
 export const SANDBOX: Mission = {
   id: 'sandbox', chapter: 99, order: 0, title: 'Sandbox', tagline: 'Free play on a copy of orbital-prod. Nothing is graded.', sandbox: true,
@@ -8,7 +9,7 @@ export const SANDBOX: Mission = {
   cluster: {
     seed: 7, nodes: orbitalNodes(), namespaces: ['freight', 'billing'], images: ORBITAL_IMAGES, evictionSeconds: 60,
     objects: [
-      ...systemWorkloads(),
+      ...systemWorkloads(), storageClass('ceph-block', { isDefault: true }), ...ingressNginx(),
       { ageSeconds: 3 * 86400, object: deployment({ name: 'frontend', ns: 'freight', image: `${REG}/frontend:1.4.0`, replicas: 3, port: 8080 }) },
       { ageSeconds: 3 * 86400, object: service({ name: 'frontend', ns: 'freight', selector: { app: 'frontend' }, port: 80, targetPort: 8080 }) },
       { ageSeconds: 2 * 86400, object: deployment({ name: 'cargo-api', ns: 'freight', image: `${REG}/cargo-api:2.1.0`, replicas: 2, port: 8080, env: [{ name: 'CARGO_DB_URL', value: 'postgres://cargo-db:5432/cargo' }] }) },

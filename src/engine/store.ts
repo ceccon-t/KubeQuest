@@ -5,6 +5,8 @@ import { resourceByKind } from './registry.ts';
 
 export class ApiError extends Error {
   reason: 'NotFound' | 'AlreadyExists' | 'Invalid' | 'Conflict' | 'BadRequest' | 'Forbidden';
+  /** When set, the exact line kubectl prints for this error (some API errors are not `Error from server (…)`). */
+  display?: string;
   constructor(reason: ApiError['reason'], message: string) {
     super(message);
     this.reason = reason;
@@ -153,6 +155,9 @@ export class ClusterStore {
       }
       return;
     }
+    // upstream: registry/core/pod/strategy.go CheckGracefulDelete — a Pod that was never bound to a node has no
+    // kubelet to wait for, so its grace period is 0 and it is removed at once
+    if (obj.kind === 'Pod' && !(obj as { spec?: { nodeName?: string } }).spec?.nodeName && !obj.metadata.finalizers?.length) { this.remove(obj); return; }
     obj.metadata.deletionTimestamp = this.clock.iso(this.clock.nowMs + graceSeconds * 1000);
     obj.metadata.deletionGracePeriodSeconds = graceSeconds;
     this.update(obj);
@@ -183,7 +188,14 @@ export class ClusterStore {
 
   // --- events ----------------------------------------------------------------
 
-  /** Record an event, de-duplicating like the event recorder (same object/reason/message → count++). */
+  /** upstream: client-go tools/record EventAggregator state — distinct messages seen per (object, type, reason, source). */
+  private similarEvents = new Map<string, { messages: Set<string>; last: number }>();
+
+  /**
+   * Record an event like the client-go event recorder: an identical event bumps `count`; the 10th
+   * *similar* event (same object, type, reason and source but another message) within 10 minutes is
+   * folded into one "(combined from similar events)" event that carries the latest message.
+   */
   event(e: EventInput): Event {
     const inv = e.involved;
     const ns = (inv as KubeObject).metadata ? (inv as KubeObject).metadata.namespace : (inv as { namespace?: string }).namespace;
@@ -191,6 +203,16 @@ export class ClusterStore {
     const uid = (inv as KubeObject).metadata ? (inv as KubeObject).metadata.uid : (inv as { uid?: string }).uid;
     const evNs = ns ?? 'default';
     const now = this.clock.iso();
+    // upstream: EventAggregatorByReasonFunc / defaultAggregateMaxEvents=10 / defaultAggregateIntervalInSeconds=600
+    const COMBINED = '(combined from similar events): ';
+    const aggKey = [evNs, inv.kind, name, uid ?? '', e.type, e.reason, e.component, e.host ?? ''].join('|');
+    let similar = this.similarEvents.get(aggKey);
+    if (!similar || this.clock.nowMs - similar.last > 600_000) { similar = { messages: new Set(), last: 0 }; this.similarEvents.set(aggKey, similar); }
+    similar.last = this.clock.nowMs;
+    similar.messages.add(e.message);
+    const combined = similar.messages.size >= 10;
+    if (combined) { const first = similar.messages.values().next().value; if (first !== undefined) similar.messages.delete(first); }
+    const message = combined ? COMBINED + e.message : e.message;
     for (const o of this.objects.values()) {
       if (o.kind !== 'Event') continue;
       const ev = o as Event;
@@ -200,11 +222,12 @@ export class ClusterStore {
         ev.involvedObject.kind === inv.kind &&
         (ev.involvedObject.uid ?? '') === (uid ?? '') &&
         ev.reason === e.reason &&
-        ev.message === e.message &&
+        (combined ? ev.message.startsWith(COMBINED) : ev.message === message) &&
         ev.type === e.type
       ) {
         ev.count += 1;
         ev.lastTimestamp = now;
+        ev.message = message;
         this.update(ev);
         return ev;
       }
@@ -215,7 +238,7 @@ export class ClusterStore {
       metadata: { name: `${name}.${(0x17a0000000000000n + BigInt(this.rv) * 7919n).toString(16)}`, namespace: evNs },
       involvedObject: { kind: inv.kind, namespace: ns, name, uid, apiVersion: (inv as KubeObject).apiVersion },
       reason: e.reason,
-      message: e.message,
+      message,
       source: e.host ? { component: e.component, host: e.host } : { component: e.component },
       firstTimestamp: now,
       lastTimestamp: now,

@@ -1,8 +1,11 @@
 /** Job and CronJob controllers (core semantics). upstream: pkg/controller/job, pkg/controller/cronjob */
 import type { Engine } from '../engine.ts';
+import { syncDue, syncFailed } from './requeue.ts';
 import type { Job, CronJob, Pod, Condition } from '../types.ts';
 import { applyDefaults } from '../defaults.ts';
 import { isPodReady } from './kubelet.ts';
+import { admitPod } from '../admission.ts';
+import { ApiError } from '../store.ts';
 
 export function jobPods(engine: Engine, job: Job): Pod[] {
   return engine.store.ownedBy<Pod>(job, 'Pod');
@@ -79,7 +82,8 @@ export function runJobController(engine: Engine): void {
     }
     const remaining = completions - succeeded.length;
     const want = Math.min(parallelism, remaining);
-    if (active.length < want) {
+    const retryKey = `job:${job.metadata.uid}`;
+    if (active.length < want && syncDue(engine, retryKey, job)) {
       const activeIdx = new Set(active.map((p) => p.metadata.annotations?.['batch.kubernetes.io/job-completion-index']));
       let nextIdx = 0;
       for (let i = active.length; i < want; i++) {
@@ -90,9 +94,17 @@ export function runJobController(engine: Engine): void {
           activeIdx.add(String(nextIdx));
         }
         const pod = newJobPod(engine, job, index);
-        engine.store.create(pod);
-        engine.store.event({ type: 'Normal', reason: 'SuccessfulCreate', message: `Created pod: ${pod.metadata.name}`, involved: job, component: 'job-controller' });
-        active.push(pod);
+        try {
+          admitPod(engine, pod);
+          engine.store.create(pod);
+          engine.store.event({ type: 'Normal', reason: 'SuccessfulCreate', message: `Created pod: ${pod.metadata.name}`, involved: job, component: 'job-controller' });
+          active.push(pod);
+        } catch (e) {
+          if (!(e instanceof ApiError)) throw e;
+          engine.store.event({ type: 'Warning', reason: 'FailedCreate', message: `Error creating: ${e.message}`, involved: job, component: 'job-controller' });
+          syncFailed(engine, retryKey, job);
+          break;
+        }
       }
     } else if (active.length > want) {
       for (const p of active.slice(want)) {

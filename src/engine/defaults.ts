@@ -1,6 +1,7 @@
 /** API-server defaulting for objects as they are admitted (so `-o yaml` shows real defaults). */
 import type { Engine } from './engine.ts';
-import type { KubeObject, Pod, PodSpec, Deployment, ReplicaSet, Service, Job, CronJob, DaemonSet, Probe, Container } from './types.ts';
+import type { KubeObject, Pod, PodSpec, Deployment, ReplicaSet, Service, Job, CronJob, DaemonSet, Probe, Container, StatefulSet, PersistentVolumeClaim, PersistentVolume, StorageClass, NetworkPolicy, HorizontalPodAutoscaler, PodDisruptionBudget, PriorityClass, Secret, Ingress } from './types.ts';
+import { b64encode } from './encoding.ts';
 import { normalizeImage } from './images.ts';
 
 export function defaultProbe(p: Probe | undefined): Probe | undefined {
@@ -21,6 +22,13 @@ export function defaultContainer(c: Container): Container {
   const img = normalizeImage(c.image);
   out.imagePullPolicy = out.imagePullPolicy ?? (img.tag === 'latest' ? 'Always' : 'IfNotPresent');
   out.resources = out.resources ?? {};
+  // API defaulting: a container with a limit and no request gets request = limit
+  if (out.resources.limits) {
+    const req = { ...(out.resources.requests ?? {}) };
+    let changed = false;
+    for (const k of Object.keys(out.resources.limits)) if (req[k] === undefined) { req[k] = out.resources.limits[k] as string | number; changed = true; }
+    if (changed) out.resources = { ...out.resources, requests: req };
+  }
   if (out.ports) out.ports = out.ports.map((p) => ({ ...p, protocol: p.protocol ?? 'TCP' }));
   if (out.livenessProbe) out.livenessProbe = defaultProbe(out.livenessProbe);
   if (out.readinessProbe) out.readinessProbe = defaultProbe(out.readinessProbe);
@@ -34,13 +42,14 @@ export function defaultPodSpec(spec: PodSpec, opts: { restartPolicy?: PodSpec['r
   const out: PodSpec = { ...spec };
   out.containers = spec.containers.map(defaultContainer);
   if (spec.initContainers) out.initContainers = spec.initContainers.map(defaultContainer);
+  if (spec.ephemeralContainers) out.ephemeralContainers = spec.ephemeralContainers.map(defaultContainer);
   out.restartPolicy = out.restartPolicy ?? opts.restartPolicy ?? 'Always';
   out.terminationGracePeriodSeconds = out.terminationGracePeriodSeconds ?? 30;
   out.dnsPolicy = out.dnsPolicy ?? 'ClusterFirst';
   out.schedulerName = out.schedulerName ?? 'default-scheduler';
   out.securityContext = out.securityContext ?? {};
   out.serviceAccountName = out.serviceAccountName ?? 'default';
-  out.serviceAccount = out.serviceAccount ?? out.serviceAccountName;
+  out.serviceAccount = out.serviceAccountName;
   out.enableServiceLinks = out.enableServiceLinks ?? true;
   out.preemptionPolicy = out.preemptionPolicy ?? 'PreemptLowerPriority';
   out.priority = out.priority ?? 0;
@@ -58,6 +67,13 @@ export function defaultTolerations(engine: Engine): NonNullable<PodSpec['tolerat
 }
 
 export function applyDefaults<T extends KubeObject>(obj: T, engine: Engine): T {
+  // a pod template may omit `metadata` altogether (typical for Jobs); the API server stores an empty one
+  const withTemplate = (spec: unknown): void => {
+    const t = (spec as { template?: { metadata?: unknown; spec?: unknown } } | undefined)?.template;
+    if (t && typeof t === 'object' && t.spec !== undefined && t.metadata === undefined) t.metadata = {};
+  };
+  withTemplate(obj.spec);
+  withTemplate((obj.spec as { jobTemplate?: { spec?: unknown } } | undefined)?.jobTemplate?.spec);
   switch (obj.kind) {
     case 'Pod': {
       const p = obj as unknown as Pod;
@@ -133,6 +149,98 @@ export function applyDefaults<T extends KubeObject>(obj: T, engine: Engine): T {
       if (s.spec.type === 'NodePort' || s.spec.type === 'LoadBalancer') s.spec.externalTrafficPolicy = s.spec.externalTrafficPolicy ?? 'Cluster';
       s.spec.ports = (s.spec.ports ?? []).map((p) => ({ protocol: 'TCP', ...p, targetPort: p.targetPort ?? p.port }));
       s.status = s.status ?? { loadBalancer: {} };
+      break;
+    }
+    case 'Namespace': {
+      const ns = obj as KubeObject;
+      // the API server stamps every namespace with its own name as a label (handy for namespaceSelectors)
+      ns.metadata.labels = { ...(ns.metadata.labels ?? {}), 'kubernetes.io/metadata.name': ns.metadata.name };
+      ns.spec = ns.spec ?? { finalizers: ['kubernetes'] };
+      ns.status = ns.status ?? { phase: 'Active' };
+      break;
+    }
+    case 'StatefulSet': {
+      const st = obj as unknown as StatefulSet;
+      st.spec.replicas = st.spec.replicas ?? 1;
+      st.spec.podManagementPolicy = st.spec.podManagementPolicy ?? 'OrderedReady';
+      st.spec.revisionHistoryLimit = st.spec.revisionHistoryLimit ?? 10;
+      const us = st.spec.updateStrategy ?? {};
+      us.type = us.type ?? 'RollingUpdate';
+      if (us.type === 'RollingUpdate') us.rollingUpdate = { partition: 0, ...(us.rollingUpdate ?? {}) };
+      st.spec.updateStrategy = us;
+      st.spec.persistentVolumeClaimRetentionPolicy = st.spec.persistentVolumeClaimRetentionPolicy ?? { whenDeleted: 'Retain', whenScaled: 'Retain' };
+      st.spec.template.metadata = st.spec.template.metadata ?? {};
+      st.spec.template.spec = defaultPodSpec(st.spec.template.spec);
+      for (const t of st.spec.volumeClaimTemplates ?? []) { t.apiVersion = 'v1'; t.kind = 'PersistentVolumeClaim'; t.spec.volumeMode = t.spec.volumeMode ?? 'Filesystem'; t.status = t.status ?? { phase: 'Pending' }; }
+      st.status = st.status ?? { replicas: 0 };
+      break;
+    }
+    case 'PersistentVolumeClaim': {
+      const c = obj as unknown as PersistentVolumeClaim;
+      c.spec.volumeMode = c.spec.volumeMode ?? 'Filesystem';
+      // DefaultStorageClass admission: a claim without a class gets the cluster default, if there is one
+      if (c.spec.storageClassName === undefined && !c.spec.volumeName) {
+        const def = engine.store.list<StorageClass>('StorageClass').find((x) => x.metadata.annotations?.['storageclass.kubernetes.io/is-default-class'] === 'true');
+        if (def) c.spec.storageClassName = def.metadata.name;
+      }
+      c.status = c.status ?? { phase: 'Pending' };
+      break;
+    }
+    case 'PersistentVolume': {
+      const v = obj as unknown as PersistentVolume;
+      v.spec.persistentVolumeReclaimPolicy = v.spec.persistentVolumeReclaimPolicy ?? 'Retain';
+      v.spec.volumeMode = v.spec.volumeMode ?? 'Filesystem';
+      v.status = v.status ?? { phase: 'Pending' };
+      break;
+    }
+    case 'StorageClass': {
+      const c = obj as unknown as StorageClass;
+      c.reclaimPolicy = c.reclaimPolicy ?? 'Delete';
+      c.volumeBindingMode = c.volumeBindingMode ?? 'Immediate';
+      break;
+    }
+    case 'NetworkPolicy': {
+      const n = obj as unknown as NetworkPolicy;
+      n.spec.podSelector = n.spec.podSelector ?? {};
+      n.spec.policyTypes = n.spec.policyTypes ?? (n.spec.egress ? ['Ingress', 'Egress'] : ['Ingress']);
+      break;
+    }
+    case 'Ingress': {
+      const i = obj as unknown as Ingress;
+      i.status = i.status ?? { loadBalancer: {} };
+      break;
+    }
+    case 'HorizontalPodAutoscaler': {
+      const h = obj as unknown as HorizontalPodAutoscaler;
+      h.spec.minReplicas = h.spec.minReplicas ?? 1;
+      h.spec.metrics = h.spec.metrics ?? [{ type: 'Resource', resource: { name: 'cpu', target: { type: 'Utilization', averageUtilization: 80 } } }];
+      h.status = h.status ?? {};
+      break;
+    }
+    case 'PodDisruptionBudget': {
+      const p = obj as unknown as PodDisruptionBudget;
+      p.status = p.status ?? { currentHealthy: 0, desiredHealthy: 0, disruptionsAllowed: 0, expectedPods: 0 };
+      break;
+    }
+    case 'PriorityClass': {
+      const p = obj as unknown as PriorityClass;
+      p.preemptionPolicy = p.preemptionPolicy ?? 'PreemptLowerPriority';
+      break;
+    }
+    case 'Secret': {
+      const sec = obj as unknown as Secret;
+      sec.type = sec.type ?? 'Opaque';
+      // stringData is write-only: the API server merges it into data (base64) and drops it
+      if (sec.stringData) { sec.data = { ...(sec.data ?? {}) }; for (const [k, v] of Object.entries(sec.stringData)) sec.data[k] = b64encode(String(v)); delete sec.stringData; }
+      break;
+    }
+    case 'Gateway': case 'GatewayClass': {
+      // the Gateway API CRDs default status to "Waiting for controller" until an implementation takes over
+      const g = obj as KubeObject;
+      if (!g.status) {
+        const c = (type: string) => ({ lastTransitionTime: '1970-01-01T00:00:00Z', message: 'Waiting for controller', reason: 'Pending', status: 'Unknown', type });
+        g.status = { conditions: g.kind === 'Gateway' ? [c('Accepted'), c('Programmed')] : [c('Accepted')] };
+      }
       break;
     }
     default:

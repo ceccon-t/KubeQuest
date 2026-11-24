@@ -2,13 +2,14 @@
 import type { Engine } from '../engine.ts';
 import type { KubeObject, Pod, Deployment, ReplicaSet, Service, Node, Namespace, Job, CronJob, DaemonSet, ConfigMap, Endpoints, Container, Probe, Event } from '../types.ts';
 import { tabwrite } from './tabwriter.ts';
-import { humanDuration, parseCpuMillis, parseMemoryBytes, formatCpuMillis } from '../duration.ts';
+import { humanDuration, parseQuantity, parseCpuMillis, parseMemoryBytes, formatCpuMillis } from '../duration.ts';
 import { labelsToString, selectorToString } from '../selector.ts';
 import { podStatusReason, nodeStatus, nodeRoles, servicePorts, cronNext } from './printers.ts';
 import { activePods } from '../controllers/replicaset.ts';
 import { replicaSetsOf, findNewReplicaSet } from '../controllers/deployment.ts';
 import { podRequests } from '../controllers/scheduler.ts';
 import { jobPods } from '../controllers/job.ts';
+import { describeExt, describeUnstructured, quotaSection, limitsSection } from './describe-ext.ts';
 
 const L0 = '', L1 = '  ', L2 = '    ', L3 = '      ';
 
@@ -21,7 +22,7 @@ export function rfc1123(iso: string | undefined): string {
   return `${days[d.getUTCDay()]}, ${p(d.getUTCDate())} ${months[d.getUTCMonth()]} ${d.getUTCFullYear()} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} +0000`;
 }
 
-class W {
+export class W {
   lines: string[] = [];
   write(prefix: string, text: string): void {
     this.lines.push(prefix + text);
@@ -37,18 +38,19 @@ class W {
   }
 }
 
-function mapLines(m: Record<string, string> | undefined, sep = '='): string {
+export function mapLines(m: Record<string, string> | undefined, sep = '='): string {
   const entries = Object.entries(m ?? {}).sort(([a], [b]) => (a < b ? -1 : 1));
   return entries.length ? entries.map(([k, v]) => `${k}${sep}${v}`).join('\n') : '<none>';
 }
 
-function annotationLines(m: Record<string, string> | undefined): string {
-  const entries = Object.entries(m ?? {}).sort(([a], [b]) => (a < b ? -1 : 1));
+export function annotationLines(m: Record<string, string> | undefined): string {
+  // upstream printAnnotationsMultiline skips the last-applied annotation
+  const entries = Object.entries(m ?? {}).filter(([k]) => k !== 'kubectl.kubernetes.io/last-applied-configuration').sort(([a], [b]) => (a < b ? -1 : 1));
   if (!entries.length) return '<none>';
   return entries.map(([k, v]) => `${k}: ${v.length > 100 ? v.slice(0, 97) + '...' : v}`).join('\n');
 }
 
-function describeEvents(w: W, engine: Engine, obj: KubeObject): void {
+export function describeEvents(w: W, engine: Engine, obj: KubeObject): void {
   const events = engine.store.eventsFor(obj);
   if (!events.length) { w.write(L0, 'Events:\t<none>'); return; }
   w.write(L0, 'Events:');
@@ -71,7 +73,7 @@ function probeString(p: Probe): string {
   return `${s} delay=${p.initialDelaySeconds ?? 0}s timeout=${p.timeoutSeconds ?? 1}s period=${p.periodSeconds ?? 10}s #success=${p.successThreshold ?? 1} #failure=${p.failureThreshold ?? 3}`;
 }
 
-function describeContainerSpec(w: W, engine: Engine, pod: Pod | undefined, c: Container, prefix: string, status?: NonNullable<Pod['status']['containerStatuses']>[number]): void {
+export function describeContainerSpec(w: W, engine: Engine, pod: Pod | undefined, c: Container, prefix: string, status?: NonNullable<Pod['status']['containerStatuses']>[number]): void {
   const P = prefix;
   const P1 = L2; // container fields always sit at 4 spaces (upstream describeContainers)
   w.write(P, `${c.name}:`);
@@ -84,6 +86,7 @@ function describeContainerSpec(w: W, engine: Engine, pod: Pod | undefined, c: Co
   if (ports.length === 0) { w.write(P1, 'Port:\t<none>'); w.write(P1, 'Host Port:\t<none>'); }
   else if (ports.length === 1) { w.write(P1, `Port:\t${ports[0]!.containerPort}/${ports[0]!.protocol ?? 'TCP'}`); w.write(P1, `Host Port:\t${ports[0]!.hostPort ?? 0}/${ports[0]!.protocol ?? 'TCP'}`); }
   else { w.write(P1, `Ports:\t${ports.map((p) => `${p.containerPort}/${p.protocol ?? 'TCP'}`).join(', ')}`); w.write(P1, `Host Ports:\t${ports.map((p) => `${p.hostPort ?? 0}/${p.protocol ?? 'TCP'}`).join(', ')}`); }
+  if (c.securityContext?.seccompProfile?.type) w.write(P1, `SeccompProfile:\t${c.securityContext.seccompProfile.type}`);
   if (c.command) { w.write(P1, 'Command:'); for (const a of c.command) w.write(P1 + '  ', a); }
   if (c.args) { w.write(P1, 'Args:'); for (const a of c.args) w.write(P1 + '  ', a); }
   if (status) {
@@ -190,13 +193,23 @@ export function describePod(engine: Engine, pod: Pod): string {
   } else w.write(L0, `Status:\t${pod.status.phase ?? 'Pending'}`);
   if (pod.status.reason) w.write(L0, `Reason:\t${pod.status.reason}`);
   if (pod.status.message) w.write(L0, `Message:\t${pod.status.message}`);
+  if (pod.spec.securityContext?.seccompProfile?.type) w.write(L0, `SeccompProfile:\t${pod.spec.securityContext.seccompProfile.type}`);
   w.write(L0, `IP:\t${pod.status.podIP ?? ''}`);
   if (pod.status.podIPs?.length) { w.write(L0, 'IPs:'); for (const ip of pod.status.podIPs) w.write(L1, `IP:\t${ip.ip}`); }
   else w.write(L0, 'IPs:\t<none>');
   const ctrl = pod.metadata.ownerReferences?.find((r) => r.controller);
   if (ctrl) w.write(L0, `Controlled By:\t${ctrl.kind}/${ctrl.name}`);
+  if (pod.status.nominatedNodeName) w.write(L0, `NominatedNodeName:\t${pod.status.nominatedNodeName}`);
+  if (pod.spec.initContainers?.length) {
+    w.write(L0, 'Init Containers:');
+    for (const c of pod.spec.initContainers) describeContainerSpec(w, engine, pod, c, L1, pod.status.initContainerStatuses?.find((s) => s.name === c.name));
+  }
   w.write(L0, 'Containers:');
   for (const c of pod.spec.containers) describeContainerSpec(w, engine, pod, c, L1, pod.status.containerStatuses?.find((s) => s.name === c.name));
+  if (pod.spec.ephemeralContainers?.length) {
+    w.write(L0, 'Ephemeral Containers:');
+    for (const c of pod.spec.ephemeralContainers) describeContainerSpec(w, engine, pod, c, L1, pod.status.ephemeralContainerStatuses?.find((s) => s.name === c.name));
+  }
   const conds = pod.status.conditions ?? [];
   if (conds.length) {
     w.write(L0, 'Conditions:');
@@ -207,11 +220,15 @@ export function describePod(engine: Engine, pod: Pod): string {
   w.write(L0, `QoS Class:\t${pod.status.qosClass ?? 'BestEffort'}`);
   w.kv(L0, 'Node-Selectors:', mapLines(pod.spec.nodeSelector));
   w.kv(L0, 'Tolerations:', tolerationsString(pod.spec.tolerations));
+  if (pod.spec.topologySpreadConstraints?.length) {
+    const lines = [...pod.spec.topologySpreadConstraints].sort((a, b) => (a.topologyKey < b.topologyKey ? -1 : 1)).map((c) => `${c.topologyKey}:${c.whenUnsatisfiable} when max skew ${c.maxSkew} is exceeded${c.labelSelector ? ` for selector ${selectorToString(c.labelSelector)}` : ''}`);
+    w.kv(L0, 'Topology Spread Constraints:', lines.join('\n'));
+  }
   describeEvents(w, engine, pod);
   return w.render();
 }
 
-function describePodTemplate(w: W, engine: Engine, tpl: Deployment['spec']['template'], prefix: string): void {
+export function describePodTemplate(w: W, engine: Engine, tpl: Deployment['spec']['template'], prefix: string): void {
   w.write(prefix, 'Pod Template:');
   const P = prefix + '  ';
   w.kv(P, 'Labels:', mapLines(tpl.metadata.labels));
@@ -256,7 +273,7 @@ export function describeDeployment(engine: Engine, d: Deployment): string {
   return w.render();
 }
 
-function podsStatusLine(pods: Pod[]): string {
+export function podsStatusLine(pods: Pod[]): string {
   let running = 0, waiting = 0, succeeded = 0, failed = 0;
   for (const p of pods) {
     switch (p.status.phase) { case 'Running': running++; break; case 'Pending': waiting++; break; case 'Succeeded': succeeded++; break; case 'Failed': failed++; break; default: break; }
@@ -361,13 +378,17 @@ export function describeNode(engine: Engine, node: Node): string {
   const allocCpu = parseCpuMillis(node.status.allocatable.cpu ?? '0');
   const allocMem = parseMemoryBytes(node.status.allocatable.memory ?? '0');
   let cpuR = 0, cpuL = 0, memR = 0, memL = 0;
-  const pct = (v: number, total: number) => (total ? `${Math.round((v / total) * 100)}%` : '0%');
-  const memStr = (b: number) => (b % (1024 ** 2) === 0 ? `${b / 1024 ** 2}Mi` : b % 1024 === 0 ? `${b / 1024}Ki` : `${b}`);
+  // upstream: describe.go describeNodeResource prints int64(fraction) — truncated, not rounded
+  const pct = (v: number, total: number) => (total ? `${Math.trunc((v / total) * 100)}%` : '0%');
+  const extReq: Record<string, number> = {}, extLim: Record<string, number> = {};
+  const memStr = (b: number) => (b === 0 ? '0' : b % (1024 ** 2) === 0 ? `${b / 1024 ** 2}Mi` : b % 1024 === 0 ? `${b / 1024}Ki` : `${b}`);
   for (const p of pods) {
     const r = podRequests(p);
     let lc = 0, lm = 0;
     for (const c of p.spec.containers) { if (c.resources?.limits?.cpu !== undefined) lc += parseCpuMillis(c.resources.limits.cpu); if (c.resources?.limits?.memory !== undefined) lm += parseMemoryBytes(c.resources.limits.memory); }
     cpuR += r.cpu; cpuL += lc; memR += r.mem; memL += lm;
+    for (const [k, v] of Object.entries(r.ext)) extReq[k] = (extReq[k] ?? 0) + v;
+    for (const c of p.spec.containers) for (const [k, v] of Object.entries(c.resources?.limits ?? {})) if (k !== 'cpu' && k !== 'memory' && k !== 'ephemeral-storage') extLim[k] = (extLim[k] ?? 0) + parseQuantity(v);
     w.write(L1, `${p.metadata.namespace}\t${p.metadata.name}\t${formatCpuMillis(r.cpu)} (${pct(r.cpu, allocCpu)})\t${formatCpuMillis(lc)} (${pct(lc, allocCpu)})\t${memStr(r.mem)} (${pct(r.mem, allocMem)})\t${memStr(lm)} (${pct(lm, allocMem)})\t${humanDuration(engine.clock.nowMs - Date.parse(p.metadata.creationTimestamp ?? ''))}`);
   }
   w.write(L0, 'Allocated resources:');
@@ -377,6 +398,8 @@ export function describeNode(engine: Engine, node: Node): string {
   w.write(L1, `cpu\t${formatCpuMillis(cpuR)} (${pct(cpuR, allocCpu)})\t${formatCpuMillis(cpuL)} (${pct(cpuL, allocCpu)})`);
   w.write(L1, `memory\t${memStr(memR)} (${pct(memR, allocMem)})\t${memStr(memL)} (${pct(memL, allocMem)})`);
   w.write(L1, 'ephemeral-storage\t0 (0%)\t0 (0%)');
+  // extended resources (GPUs, …) are listed without a percentage
+  for (const k of Object.keys(node.status.allocatable).filter((x) => !['cpu', 'memory', 'ephemeral-storage', 'pods'].includes(x) && !x.startsWith('hugepages-')).sort()) w.write(L1, `${k}\t${extReq[k] ?? 0}\t${extLim[k] ?? 0}`);
   describeEvents(w, engine, node);
   return w.render();
 }
@@ -388,10 +411,9 @@ export function describeNamespace(engine: Engine, ns: Namespace): string {
   w.kv(L0, 'Annotations:', annotationLines(ns.metadata.annotations));
   w.write(L0, `Status:\t${ns.status?.phase ?? 'Active'}`);
   w.write(L0, '');
-  w.write(L0, 'No resource quota.');
+  quotaSection(w, engine, ns.metadata.name);
   w.write(L0, '');
-  w.write(L0, 'No LimitRange resource.');
-  void engine;
+  limitsSection(w, engine, ns.metadata.name);
   return w.render();
 }
 
@@ -505,11 +527,10 @@ export function describeEndpoints(engine: Engine, ep: Endpoints): string {
 export function describeGeneric(engine: Engine, obj: KubeObject): string {
   const w = new W();
   w.write(L0, `Name:\t${obj.metadata.name}`);
-  if (obj.metadata.namespace) w.write(L0, `Namespace:\t${obj.metadata.namespace}`);
+  w.write(L0, `Namespace:\t${obj.metadata.namespace ?? ''}`);
   w.kv(L0, 'Labels:', mapLines(obj.metadata.labels));
   w.kv(L0, 'Annotations:', annotationLines(obj.metadata.annotations));
-  w.write(L0, `API Version:\t${obj.apiVersion}`);
-  w.write(L0, `Kind:\t${obj.kind}`);
+  describeUnstructured(w, 0, obj as unknown as Record<string, unknown>, '');
   describeEvents(w, engine, obj);
   return w.render();
 }
@@ -527,7 +548,7 @@ export function describe(engine: Engine, obj: KubeObject): string {
     case 'DaemonSet': return describeDaemonSet(engine, obj as DaemonSet);
     case 'ConfigMap': return describeConfigMap(engine, obj as ConfigMap);
     case 'Endpoints': return describeEndpoints(engine, obj as Endpoints);
-    default: return describeGeneric(engine, obj);
+    default: return describeExt(engine, obj) ?? describeGeneric(engine, obj);
   }
 }
 

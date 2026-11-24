@@ -5,12 +5,11 @@ import type { OutputChunk, ShellHost } from './kubectl/context.ts';
 import { out, err } from './kubectl/context.ts';
 import { tokenize } from './kubectl/args.ts';
 import { runKubectl, COMMANDS } from './kubectl/index.ts';
-import { clusterHttp } from './container-shell.ts';
-import type { PortForward } from './kubectl/commands/logs.ts';
-import { requestPod } from './appsim.ts';
+import { runCurl } from './http.ts';
+import { b64encode, b64decode } from './encoding.ts';
+import { runGit, initGitRepos } from './git.ts';
+import { runHelm } from './helm.ts';
 import { allResources } from './registry.ts';
-import { resolveTargetPort } from './controllers/service.ts';
-import type { Pod, Service, Node } from './types.ts';
 
 export interface ExecRecord {
   /** The line as typed. */
@@ -32,7 +31,9 @@ const HELP = `Kubequest workstation shell. Available commands:
   ls, cat, cd, pwd  browse the manifests in your workstation
   vim|nano|edit F   open F in the editor (Ctrl+S to save, Esc to cancel)
   grep, head, tail, wc, sort, uniq    text filters (use with pipes: kubectl get pods | grep web)
+  base64 [-d]       encode / decode (kubectl get secret X -o jsonpath='{.data.key}' | base64 -d)
   curl URL          HTTP from your workstation (works with port-forward or NodePort/LoadBalancer IPs)
+  git, helm         version control for manifests and the Helm package manager (later chapters)
   watch CMD         re-run CMD every 2s (Ctrl+C to stop)
   CMD &             run a long-running command in the background (e.g. port-forward)
   jobs, kill %N     list / stop background jobs
@@ -56,6 +57,7 @@ export class Shell {
     this.engine = engine;
     this.vfs = vfs;
     this.host = host;
+    initGitRepos(engine, vfs);
   }
 
   /** Execute a line; yields output chunks, returns exit code. Records history. */
@@ -67,6 +69,8 @@ export class Shell {
     this.currentRecord = rec;
     let code = 0;
     try {
+      // honest "not supported": this terminal reads one line at a time, so a here-document has no body to read
+      if (/<<-?\s*['"]?[A-Za-z_]/.test(trimmed.replace(/'[^']*'|"[^"]*"/g, ''))) throw new Error('kubequest: here-documents (<<EOF) are not supported in this terminal; put the manifest in a file (vim FILE.yaml) and use -f FILE.yaml');
       const chained = splitChain(trimmed);
       for (const { cmd, op } of chained) {
         if (op === '&&' && code !== 0) continue;
@@ -288,6 +292,21 @@ export class Shell {
         yield out(lines.map((l) => l.split(delim)[field - 1] ?? '').join('\n') + (lines.length ? '\n' : ''));
         return 0;
       }
+      case 'base64': {
+        // `base64` encodes stdin/file; `-d`/`--decode` decodes (how you read a Secret value)
+        const decode = args.includes('-d') || args.includes('--decode') || args.includes('-D');
+        const file = args.find((x) => !x.startsWith('-'));
+        const input = file ? this.vfs.read(file) : stdin;
+        if (input === undefined) { yield err(file ? `base64: ${file}: No such file or directory\n` : ''); return file ? 1 : 0; }
+        if (decode) {
+          const text = b64decode(input.trim());
+          if (text === undefined) { yield err('base64: invalid input\n'); return 1; }
+          yield out(text);
+          return 0;
+        }
+        yield out(b64encode(input) + '\n');
+        return 0;
+      }
       case 'tr': { const [from, to] = args; if (!from || to === undefined) return 1; yield out((stdin ?? '').split(from).join(to)); return 0; }
       case 'xargs': { const sub = args.length ? args : ['echo']; const extra = (stdin ?? '').split(/\s+/).filter((w) => w); return yield* this.runOne([...sub, ...extra], host, undefined); }
       case 'sleep': { const s = parseFloat(args[0] ?? '1'); await host.sleep(s * 1000); return 0; }
@@ -326,7 +345,11 @@ export class Shell {
       case 'exit': case 'logout': yield out('(kubequest: this is your on-call workstation — there is nowhere to exit to. Finish the ticket!)\n'); return 0;
       case 'sudo': yield out(`oncall is not in the sudoers file.  This incident will be reported.\n`); return 1;
       case 'docker': case 'podman': yield err(`${cmd}: command not found\n(kubequest: images are built in CI at Orbital Logistics; the registry already has what you need)\n`); return 127;
-      case 'helm': case 'kustomize': case 'kind': case 'minikube': case 'k9s': yield err(`${cmd}: command not found\n(kubequest: ${cmd} is covered in a later chapter)\n`); return 127;
+      case 'git': { const r = runGit(this.engine, this.vfs, args); for (const c of r.chunks) yield c; return r.code; }
+      case 'helm': { const r = runHelm(this.engine, this.vfs, args); for (const c of r.chunks) yield c; return r.code; }
+      case 'kustomize': yield err('kustomize: command not found\n(kubequest: Kustomize is built into kubectl — use `kubectl kustomize DIR` or `kubectl apply -k DIR`)\n'); return 127;
+      case 'argocd': yield err('argocd: command not found\n(kubequest: Applications are plain resources — `kubectl get applications -n argocd`)\n'); return 127;
+      case 'kind': case 'minikube': case 'k9s': yield err(`${cmd}: command not found\n(kubequest: this workstation talks to orbital-prod only)\n`); return 127;
       default:
         yield err(`${cmd}: command not found\n`);
         return 127;
@@ -334,46 +357,9 @@ export class Shell {
   }
 
   private async *curl(cmd: string, args: string[]): AsyncGenerator<OutputChunk, number> {
-    // Flags that consume the next argument (-o FILE, -H HEADER, ...) — skip their values when looking for the URL.
-    const valueFlags = new Set(['-o', '-H', '-X', '-d', '--data', '-m', '--max-time', '-u', '-A', '-w', '-e']);
-    const url = args.find((a, i) => !a.startsWith('-') && !/^\d+$/.test(a) && !valueFlags.has(args[i - 1] ?? ''));
-    if (!url) { yield err(cmd === 'curl' ? "curl: try 'curl --help' for more information\n" : 'wget: missing URL\n'); return 2; }
-    const m = /^(?:(https?):\/\/)?([^/:]+)(?::(\d+))?(\/.*)?$/.exec(url);
-    if (!m) { yield err(`curl: (3) URL using bad/illegal format or missing URL\n`); return 3; }
-    const host = m[2] as string;
-    const port = m[3] ? parseInt(m[3], 10) : 80;
-    const path = m[4] ?? '/';
-    const headersOnly = args.includes('-I') || args.includes('-i') || args.includes('-v');
-    const fail = (code: number, msg: string): OutputChunk => err(cmd === 'wget' ? `wget: unable to resolve host address '${host}'\n` : `curl: (${code}) ${msg}\n`);
-    if (host === 'localhost' || host === '127.0.0.1') {
-      const forwards = (this.engine.scratch.get('port-forwards') as PortForward[] | undefined) ?? [];
-      const f = forwards.find((x) => x.local === port);
-      if (!f) { yield fail(7, `Failed to connect to ${host} port ${port} after 0 ms: Couldn't connect to server`); return 7; }
-      const pod = f.target.pod ? this.engine.store.getByUid<Pod>(f.target.pod.metadata.uid as string) : undefined;
-      if (!pod) { yield fail(52, 'Empty reply from server'); return 52; }
-      const r = requestPod(this.engine, pod, f.remote, path);
-      if (!r.ok) { yield fail(r.error === 'refused' ? 56 : 28, r.error === 'refused' ? 'Recv failure: Connection reset by peer' : 'Operation timed out'); return r.error === 'refused' ? 56 : 28; }
-      if (headersOnly) yield out(`HTTP/1.1 ${r.status} ${r.status === 200 ? 'OK' : r.status === 503 ? 'Service Unavailable' : r.status === 404 ? 'Not Found' : ''}\nContent-Type: text/plain; charset=utf-8\nContent-Length: ${r.body.length}\n\n`);
-      yield out(r.body);
-      return 0;
-    }
-    // node IPs with NodePort, LoadBalancer IPs
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
-      for (const svc of this.engine.store.list<Service>('Service')) {
-        const lbIp = svc.status.loadBalancer?.ingress?.[0]?.ip;
-        const isNode = this.engine.store.list('Node').some((n) => (n as unknown as Node).status.addresses.some((a) => a.address === host));
-        const sp = (svc.spec.ports ?? []).find((p) => (lbIp === host && p.port === port) || (isNode && p.nodePort === port));
-        if (!sp) continue;
-        const r = clusterHttp(this.engine, svc.metadata.namespace as string, `${svc.spec.clusterIP}:${sp.port}${path}`);
-        for (const c of r.chunks) yield c;
-        return r.code;
-      }
-      if (this.engine.store.list('Node').some((n) => (n as unknown as Node).status.addresses.some((a) => a.address === host))) { yield fail(7, `Failed to connect to ${host} port ${port} after 3 ms: Couldn't connect to server`); return 7; }
-      yield fail(28, `Failed to connect to ${host} port ${port} after 5000 ms: Connection timed out`); return 28;
-    }
-    // service DNS names do not resolve from the workstation (outside the cluster) — a classic lesson
-    yield fail(6, `Could not resolve host: ${host}`);
-    return 6;
+    const r = runCurl(this.engine, { writeFile: (p, c) => this.vfs.write(p, c) }, cmd === 'wget' ? 'wget' : 'curl', args);
+    for (const c of r.chunks) yield c;
+    return r.code;
   }
 
   /** Tab completion candidates for the current line. */
@@ -384,7 +370,7 @@ export class Shell {
     let cands: string[] = [];
     const first = before[0] ? (this.aliases[before[0]] ?? before[0]) : undefined;
     if (before.length === 0) {
-      cands = ['kubectl', 'k', 'ls', 'cat', 'cd', 'vim', 'nano', 'grep', 'curl', 'watch', 'clear', 'help', 'history', 'jobs'];
+      cands = ['kubectl', 'k', 'ls', 'cat', 'cd', 'vim', 'nano', 'grep', 'curl', 'watch', 'clear', 'help', 'history', 'jobs', 'git', 'helm', 'base64'];
     } else if (first === 'kubectl') {
       const sub = before[1];
       const resourceWords = allResources().flatMap((r) => [r.plural, ...r.shortNames]);
@@ -394,9 +380,10 @@ export class Shell {
         cands = [...(cmd?.flags ?? []).map((f) => `--${f.name}`), '--namespace', '-n', '-A', '-o'];
       } else if (sub === 'rollout' && before.length === 2) cands = ['status', 'history', 'undo', 'restart', 'pause', 'resume'];
       else if (sub === 'config' && before.length === 2) cands = ['current-context', 'get-contexts', 'use-context', 'set-context', 'view'];
-      else if (sub === 'set' && before.length === 2) cands = ['image', 'env', 'resources'];
-      else if (sub === 'create' && before.length === 2) cands = ['namespace', 'deployment', 'configmap', 'secret', 'job', 'cronjob', 'service', '-f'];
-      else if (['get', 'describe', 'delete', 'edit', 'scale', 'label', 'annotate', 'expose', 'top', 'wait', 'explain'].includes(sub) || (['rollout', 'set', 'logs', 'exec', 'port-forward'].includes(sub))) {
+      else if (sub === 'set' && before.length === 2) cands = ['image', 'env', 'resources', 'serviceaccount'];
+      else if (sub === 'auth' && before.length === 2) cands = ['can-i', 'whoami'];
+      else if (sub === 'create' && before.length === 2) cands = ['namespace', 'deployment', 'configmap', 'secret', 'job', 'cronjob', 'service', 'serviceaccount', 'role', 'rolebinding', 'clusterrole', 'clusterrolebinding', 'ingress', 'poddisruptionbudget', 'quota', 'priorityclass', 'token', '-f'];
+      else if (['get', 'describe', 'delete', 'edit', 'scale', 'label', 'annotate', 'expose', 'top', 'wait', 'explain', 'patch', 'autoscale', 'taint', 'debug'].includes(sub) || (['rollout', 'set', 'logs', 'exec', 'port-forward'].includes(sub))) {
         const prevTok = before[before.length - 1] as string;
         const ns = (() => { const i = before.indexOf('-n'); if (i >= 0 && before[i + 1]) return before[i + 1]; const j = before.findIndex((t) => t.startsWith('--namespace=')); if (j >= 0) return (before[j] as string).split('=')[1]; return this.engine.currentNamespace; })();
         if (prevTok === '-n' || prevTok === '--namespace') cands = this.engine.store.list('Namespace').map((n) => n.metadata.name);
@@ -475,6 +462,8 @@ async function* grep(args: string[], stdin: string | undefined, vfs: Vfs): Async
     if (a === '-e') { pattern = args[++i]; continue; }
     if (a.startsWith('-') && a.length > 1 && pattern === undefined || (a.startsWith('-') && !/^-\d/.test(a) && a.length > 1 && /^-[ivcEnoABC]+$/.test(a))) {
       if (a === '-A' || a === '-B' || a === '-C') { const n = parseInt(args[++i] ?? '0', 10); if (a !== '-B') after = n; if (a !== '-A') before = n; continue; }
+      const ctxFlag = /^-([ABC])(\d+)$/.exec(a);
+      if (ctxFlag) { const n = parseInt(ctxFlag[2] as string, 10); if (ctxFlag[1] !== 'B') after = n; if (ctxFlag[1] !== 'A') before = n; continue; }
       for (const f of a.slice(1)) {
         if (f === 'i') ignoreCase = true; else if (f === 'v') invert = true; else if (f === 'c') count = true; else if (f === 'E') extended = true; else if (f === 'n') lineNo = true; else if (f === 'o') only = true;
         else if (/\d/.test(f)) { after = before = parseInt(a.slice(1), 10); break; }

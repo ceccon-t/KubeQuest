@@ -22,21 +22,40 @@ check: `grep -r "from '../ui" src/engine src/game` must be empty.
 |---|---|---|
 | `engine.ts` | `Engine`: clock, RNG, store, runtimes, IP allocation, `tick()` controller order, `ClusterSetup` → initial objects with ages (fast-forward) | adding a controller (append to `tick()`), new cluster-level knobs |
 | `clock.ts`, `rng.ts` | deterministic time and randomness (`suffix()`, `hash()` mimic upstream encodings) | — |
-| `store.ts` | `ClusterStore`: objects as JSON by kind/ns/name + uid, resourceVersion/generation, graceful `markDeleting`, owner refs, **events** (dedup with count) | new server-side behaviours (finalizers, watch) |
-| `registry.ts` | resource kinds, groups, plurals, short names, `qualifiedName()` | adding a kind (one row) |
+| `store.ts` | `ClusterStore`: objects as JSON by kind/ns/name + uid, resourceVersion/generation, graceful `markDeleting` (unbound Pods go at once), owner refs, **events** (dedup with count; similar events combined after ten, like client-go's aggregator), `ApiError` | new server-side behaviours (watch) |
+| `registry.ts` | resource kinds, groups, plurals, short names, `qualifiedName()`; CRD-backed kinds are added at run time (`useDynamicResources`) | adding a built-in kind (one row) |
 | `types.ts` | TS shapes of API objects (subset) | adding fields/kinds |
-| `defaults.ts` | API-server defaulting (probes, strategy, tolerations, QoS) | new kinds' defaults |
+| `defaults.ts` | API-server defaulting (probes, strategy, tolerations, QoS, requests from limits, default StorageClass, empty template metadata) | new kinds' defaults |
+| `rbac.ts` | users, groups, ServiceAccount identities, `authorize()`, bootstrap ClusterRoles (`cluster-admin`, `admin`, `edit`, `view`), upstream Forbidden text | authorization features |
+| `admission.ts`, `podsecurity.ts`, `cel.ts` | the admission chain run on every write: ServiceAccount, PriorityClass, LimitRange, Pod Security Admission, ValidatingAdmissionPolicy (CEL subset), ResourceQuota | a new admission plugin (append to `admit()`) |
+| `patch.ts` | JSON merge patch, strategic merge patch, JSON patch | — |
+| `encoding.ts` | base64, SHA-256, simulated X.509 certificates | — |
 | `images.ts` | image catalogue + `ContainerBehaviour` (process simulation knobs) | new app behaviours, failure modes |
 | `runtime.ts` | per-pod/per-node sim state kept **outside** objects | new runtime facts |
-| `appsim.ts` | how a container answers TCP/HTTP (probes, traffic, curl share it) | protocol features |
-| `controllers/kubelet.ts` | pulls, start/crash/backoff, probes, OOM, graceful stop, `status` | container lifecycle fidelity |
-| `controllers/scheduler.ts` | filters (resources, selectors, taints, affinity), scoring, `FailedScheduling` text | scheduling features (spread, priority) |
+| `appsim.ts` | how a container answers TCP/HTTP (probes, traffic, curl share it): NetworkPolicy drops, proxies, upstream calls, load shedding | protocol features |
+| `netpol.ts` | NetworkPolicy evaluation (`ingressAllowed`, `egressAllowed`, `dnsAllowed`) | policy features |
+| `routing.ts` | L7 routing for Ingress (ingress-nginx) and Gateway API (Envoy Gateway): hosts, paths, weights, TLS | route features |
+| `http.ts` | the `curl`/`wget` client shared by the workstation and containers | client flags |
+| `containerfs.ts` | container files and volumes (emptyDir, ConfigMap, Secret, PVC) | volume types |
+| `kustomize.ts` | `kustomize build` (v5.5 subset: resources, namespace, name prefix/suffix, labels, images, replicas, patches, generators with the upstream name hash) | more transformers |
+| `helm.ts` | `helm` v3 for local charts: Go-template/Sprig subset, releases stored as Secrets, install/upgrade/rollback/history | template functions |
+| `git.ts` | `git` for the workstation (one branch, one remote); remotes are what the GitOps controller reads | git commands |
+| `controllers/kubelet.ts` | pulls (incl. pull secrets), init/sidecar/ephemeral containers, start/crash/backoff, probes, OOM, security contexts, volumes, graceful stop, `status` | container lifecycle fidelity |
+| `controllers/scheduler.ts` | filters (resources incl. extended ones, selectors, taints, node/pod affinity, PVC binding, topology spread with `matchLabelKeys`), scoring, priority preemption, `FailedScheduling` text | scheduling features |
 | `controllers/node.ts` | Ready/NotReady, taints, taint-based eviction, `setNodeReady` chaos hook | node features |
 | `controllers/replicaset.ts` | reconcile, adoption/release, deletion ranking | — |
 | `controllers/deployment.ts` | RS per template hash, RollingUpdate/Recreate maths, revisions, rollback, conditions | strategies, progress deadline tuning |
-| `controllers/daemonset.ts`, `job.ts` | DaemonSet; Job/CronJob (cron parser in `job.ts`) | StatefulSet (new file) |
-| `controllers/service.ts` | ClusterIP/NodePort/LB allocation, Endpoints + EndpointSlice sync, `resolveDns` | Ingress/Gateway, NetworkPolicy |
-| `controllers/gc.ts` | owner cascade, non-pod deletions | finalizers |
+| `controllers/daemonset.ts`, `job.ts` | DaemonSet; Job/CronJob (cron parser in `job.ts`) | — |
+| `controllers/statefulset.ts` | ordered Pods with stable names, one claim per ordinal from `volumeClaimTemplates`, ordered rolling update | update strategies |
+| `controllers/storage.ts` | dynamic provisioning, PVC↔PV binding, `WaitForFirstConsumer`, reclaim policy, pvc-protection finalizer | CSI features |
+| `controllers/hpa.ts` | HorizontalPodAutoscaler v2: Resource and Pods metrics, 15 s sync, tolerance, scale-down stabilization | metric types, `behavior` |
+| `controllers/policy.ts` | namespace bootstrap (default ServiceAccount, `kube-root-ca.crt`), PDB status, quota status, the eviction API (`evictPod`) | — |
+| `controllers/ingress.ts` | ingress-nginx and Envoy Gateway control loops: status, addresses, generated proxy Deployments | controllers for other classes |
+| `controllers/crd.ts` | CRDs → dynamic kinds, OpenAPI validation of custom resources, the operator framework (`OperatorSpec.reconcile(api)`, run while the operator's Pod is Ready) | a new operator (a `ClusterSetup.operators` entry) |
+| `controllers/gitops.ts` | Argo CD `Application`: fetch, render (Kustomize or plain YAML), diff, automated sync, self-heal, prune, health | sync options |
+| `controllers/requeue.ts` | client-go's retry back-off for failed syncs (`syncDue`/`syncFailed`/`syncSucceeded`) | — |
+| `controllers/service.ts` | ClusterIP/NodePort/LB allocation, headless Services and per-Pod DNS records, Endpoints + EndpointSlice sync, `resolveDns` | — |
+| `controllers/gc.ts` | owner cascade, non-pod deletions, finalizers, event TTL (1 h) | — |
 | `traffic.ts` | synthetic requests per Service, SLO window, packet buffer (`drain()` for UI) | request patterns, latency |
 | `vfs.ts` | in-memory workstation files | — |
 | `shell.ts` | `Shell`: pipes, redirects, `$(…)`, `&` jobs, builtins (`grep`, `curl` …), history (`line` + `expanded`), Tab completion | new builtins, completion rules |
@@ -50,11 +69,16 @@ check: `grep -r "from '../ui" src/engine src/game` must be empty.
 plus namespace rules, `printers.ts` + `tabwriter.ts` reproduce `kubectl get` tables,
 `describe.ts` the `describe` layouts, `output.ts` `-o yaml|json|name|jsonpath` (`jsonpath.ts`),
 `validate.ts` the OpenAPI-style unknown-field and semantic validation with upstream strings,
-`unsupported.ts` the honest failure path, `explain-docs.ts`/`help-text.ts` static docs.
+`api.ts` the write path every mutating command goes through (authorize → admit → store, warnings,
+`formatApiError`), `printers-ext.ts`/`describe-ext.ts` the layouts of the post-MVP kinds (and a
+generic describer for custom resources), `unsupported.ts` the honest failure path,
+`explain-docs.ts`/`help-text.ts` static docs.
 Commands live in `commands/`: `get`, `describe`, `apply` (+`create`, `edit`), `imperative`
 (`run`, `delete`, `scale`, `label`, `annotate`, `expose`), `rollout` (+`set`), `logs` (+`exec`,
 `port-forward`), `misc` (`config`, `version`, `cluster-info`, `api-resources`, `explain`, `top`,
-`wait`, `cordon`, `uncordon`, `drain`, `help`).
+`wait`, `cordon`, `uncordon`, `drain`, `help`), `extra` (`auth`, `taint`, `autoscale`, `patch`,
+`debug`, `kustomize`), `generators` (the `kubectl create <kind>` generators). The global flags
+`--as`/`--as-group` set `CommandContext.user`; reads and writes are authorized against it.
 
 **Adding a command:** create `commands/foo.ts` exporting a `KubectlCommand`, register it in
 `index.ts` `COMMANDS`, add completion in `shell.ts` if it takes resources, add a test in
@@ -79,6 +103,12 @@ Commands live in `commands/`: `get`, `describe`, `apply` (+`create`, `edit`), `i
 (`deployment`, `service`, `pod`, `configMap`), cluster presets (`orbitalNodes`, `systemWorkloads`)
 and objective helpers (`usedCmd`, `usedCmdAll`, `outputHad`). Chapters are `chN.ts`; `lessons.ts` holds each mission's briefing lesson and `insights.ts` the per-objective
 insights, both keyed by id and merged in `index.ts`; `index.ts` orders chapters and defines unlocking; `sandbox.ts` is free play.
+`platform.ts` holds the cluster add-ons missions install as seed objects — `ingressNginx()`,
+`gatewayApiCrds()`/`envoyGateway()`, `argoCd()`, `storageClass()`, `tlsPair()` — and the `crd()`/`S`
+helpers for writing CRDs. Chapters: `ch0`–`ch4`, `ch4b` (routing and network policy), `ch5`
+(configuration, state, security), `ch6` (production operations), `ch7` (delivery and extension), `ch8`
+(specialization tracks). Operators that missions need (the RouteCache operator in 7.4, the Chaos Mesh
+PodChaos controller in 8.3) are `OperatorSpec`s defined next to the mission.
 **Adding a mission:** write it in the chapter file, add to the chapter array, include a
 `solution`; `tests/missions/solvability.test.ts` picks it up automatically and requires ≥2 stars.
 
@@ -106,6 +136,8 @@ builds for Linux/Windows/macOS, draft release on `v*` tags).
 ## 7. Tests (`tests/`)
 `engine/yaml.test.ts`, `engine/controllers.test.ts` (scenario tests with `engine.advance`),
 `engine/kubectl.test.ts` (end-to-end through the shell; golden layouts and error strings),
+`engine/platform.test.ts` (RBAC, admission, CRDs, storage, StatefulSets, scheduling, HPA, PDB/drain,
+NetworkPolicy, Kustomize, Helm, GitOps, events and retry back-off),
 `missions/solvability.test.ts` (every mission's solution, run through `MissionRuntime`),
 `missions/content.test.ts` (lesson, insight and concept-card rules),
 `game/runtime.test.ts` (pause/restart semantics).
@@ -116,13 +148,26 @@ Run with `npm test` (Node's test runner, TypeScript stripped natively).
   `KubectlProxyBackend` would implement `exec(line)` by spawning the user's `kubectl` and feed
   the map from `kubectl get -o json` into a read-only `ClusterStore`.
 - **New kinds**: registry row + types + defaults + validator schema + printer columns + describe.
-- **Chapters 5–8**: ConfigMap/Secret volumes and StatefulSet/PV/PVC need a storage controller;
-  RBAC needs an identity on `CommandContext` and `kubectl auth can-i`; NetworkPolicy plugs into
-  `appsim.requestPod`; HPA reads `podUsage`; PDB gates `drain` and the RS deletion path.
+- **Operators**: a `ClusterSetup.operators` entry is a reconcile function that runs while a Pod of
+  its image is Ready and acts with that Pod's ServiceAccount (`api.can`, `api.apply`, `api.setStatus`).
+- **Cluster add-ons**: seed objects plus an image behaviour (for example `controller: 'argocd'`);
+  see `missions/platform.ts`.
+- **Lazy chapters**: chapter modules are independent, so the bundle can load them on demand if the
+  size budget (TECH_SPEC §9) becomes a concern.
 - **Challenge mode**: `MissionRuntime` already takes a mission; a generator that remixes
   `chaos` with a seed is all that is missing.
 
 ## 9. Known gaps (tracked as `TODO(fidelity)`)
-`describe` for StatefulSet/Ingress; `get -w --output-watch-events`; `patch`/`diff`/`debug`;
-`custom-columns`; multiple kubeconfig contexts; init containers run as regular containers;
-DaemonSet pods set `nodeName` through affinity only.
+`get -w --output-watch-events`; `diff`/`replace`/`cp`/`attach`; `custom-columns`; multiple kubeconfig
+contexts; DaemonSet pods set `nodeName` through affinity only; here-documents in the terminal.
+Deliberate simplifications of the post-MVP features:
+- Error text that upstream builds from a Go struct dump is abbreviated (Job `spec.template` immutability
+  prints `core.PodTemplateSpec{…}`; the PVC immutability error omits the trailing diff).
+- The event recorder's spam filter (burst 25 per object) is not simulated; aggregation and the TTL are.
+- A node taken down by a mission's chaos event turns NotReady at once (no 40 s monitor grace period).
+- Helm templates and Kustomize fields outside the supported subset fail with a "not supported" error.
+- Argo CD is the application controller only (no CLI, UI, projects or sync waves); syncs merge the
+  desired manifest over the live object.
+- Chaos Mesh is `PodChaos` with `action: pod-kill` only.
+- Tick time at 100 pods is about 2 ms on a 2024 laptop — above the 1 ms budget, as it already was
+  before the post-MVP controllers (most of it is `store.list` scans in the kubelet).

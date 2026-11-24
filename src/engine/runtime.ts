@@ -52,6 +52,24 @@ export interface ContainerRuntime {
   /** Job attempt index for failUntilAttempt behaviour. */
   attempt: number;
   sigtermAt?: number;
+  /** Init container (runs to completion before the app containers start); `sidecar` = restartPolicy Always. */
+  init?: boolean;
+  sidecar?: boolean;
+  /** Ephemeral debug container (`kubectl debug`). */
+  ephemeral?: boolean;
+  /** Last image pull error (shown in the waiting state while backing off). */
+  pullError?: string;
+  /** Sink for apps that log to a file (`logFile` behaviour). */
+  fileLog?: (text: string) => void;
+  /** The container's own writable layer (absolute path → content); gone when the container restarts. */
+  fs?: Map<string, string>;
+  /** Shell images started with a command run it as a small script (init containers, sidecars, debug pods). */
+  script?: { steps: string[]; index: number; resumeAt: number; code: number; blocked?: boolean };
+  /** Record counter of a `stateful` datastore image. */
+  records?: number;
+  lastRecordAt?: number;
+  /** When set the process is up but answers 503 with this text (e.g. it cannot reach the Kubernetes API). */
+  degraded?: string;
 }
 
 export interface PodRuntime {

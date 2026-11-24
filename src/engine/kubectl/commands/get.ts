@@ -8,6 +8,7 @@ import type { KubeObject } from '../../types.ts';
 import { tabwrite } from '../tabwriter.ts';
 import { stringify, toJsonPretty } from '../../yaml.ts';
 import { forOutput } from '../output.ts';
+import { access } from '../api.ts';
 
 function sortObjects(objs: KubeObject[], sortBy: string | undefined): KubeObject[] {
   if (!sortBy) return objs;
@@ -64,7 +65,7 @@ export const getCommand: KubectlCommand = {
       const groups: { ref: ResourceRef; objs: KubeObject[] }[] = [];
       for (const ref of refs) {
         let objs: KubeObject[];
-        try { objs = fetch(ctx.engine, ref, ctx.namespace, allNs, selector, fieldSel); }
+        try { objs = fetch(ctx.engine, ref, ctx.namespace, allNs, selector, fieldSel, access(ctx)); }
         catch (e) { if (ignoreNotFound && e instanceof KubectlError && e.message.includes('NotFound')) continue; throw e; }
         groups.push({ ref, objs: sortObjects(objs, str(a, 'sort-by')) });
       }

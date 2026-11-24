@@ -4,6 +4,7 @@ import { humanDuration } from '../duration.ts';
 import { labelsToString, selectorToString } from '../selector.ts';
 import { resourceByKind } from '../registry.ts';
 import { nextCronTime, parseCron } from '../controllers/job.ts';
+import { buildExtTable } from './printers-ext.ts';
 
 export interface Table {
   headers: string[];
@@ -46,7 +47,21 @@ export function age(obj: KubeObject, nowMs: number): string {
 export function podStatusReason(pod: Pod): string {
   let reason: string = pod.status.phase ?? 'Pending';
   if (pod.status.reason) reason = pod.status.reason;
-  const statuses = pod.status.containerStatuses ?? [];
+  // upstream printPod: an unfinished init container decides the STATUS (Init:0/1, Init:CrashLoopBackOff, Init:Error…)
+  let initializing = false;
+  const inits = pod.status.initContainerStatuses ?? [];
+  for (let i = 0; i < inits.length; i++) {
+    const c = inits[i] as NonNullable<Pod['status']['initContainerStatuses']>[number];
+    const sidecar = (pod.spec.initContainers?.find((x) => x.name === c.name) as { restartPolicy?: string } | undefined)?.restartPolicy === 'Always';
+    if (c.state.terminated && c.state.terminated.exitCode === 0) continue;
+    if (sidecar && c.started) continue;
+    if (c.state.terminated) reason = c.state.terminated.reason ? `Init:${c.state.terminated.reason}` : `Init:ExitCode:${c.state.terminated.exitCode}`;
+    else if (c.state.waiting?.reason && c.state.waiting.reason !== 'PodInitializing') reason = `Init:${c.state.waiting.reason}`;
+    else reason = `Init:${i}/${inits.length}`;
+    initializing = true;
+    break;
+  }
+  const statuses = initializing ? [] : (pod.status.containerStatuses ?? []);
   let hasRunning = false;
   for (let i = statuses.length - 1; i >= 0; i--) {
     const c = statuses[i] as NonNullable<Pod['status']['containerStatuses']>[number];
@@ -65,15 +80,17 @@ export function podStatusReason(pod: Pod): string {
 
 export function podReady(pod: Pod): string {
   const statuses = pod.status.containerStatuses ?? [];
-  const total = pod.spec.containers.length;
-  const ready = statuses.filter((c) => c.ready && c.state.running).length;
+  // restartable init containers (sidecars) count as containers of the pod
+  const sidecars = (pod.spec.initContainers ?? []).filter((c) => (c as { restartPolicy?: string }).restartPolicy === 'Always').map((c) => c.name);
+  const total = pod.spec.containers.length + sidecars.length;
+  const ready = statuses.filter((c) => c.ready && c.state.running).length + (pod.status.initContainerStatuses ?? []).filter((c) => sidecars.includes(c.name) && c.ready && c.state.running).length;
   return `${ready}/${total}`;
 }
 
 export function podRestarts(pod: Pod, nowMs: number): string {
   let restarts = 0;
   let last = 0;
-  for (const c of pod.status.containerStatuses ?? []) {
+  for (const c of [...(pod.status.initContainerStatuses ?? []), ...(pod.status.containerStatuses ?? [])]) {
     restarts += c.restartCount;
     const f = c.lastState.terminated?.finishedAt;
     if (f) last = Math.max(last, Date.parse(f));
@@ -300,6 +317,8 @@ export function buildTable(kind: string, objs: KubeObject[], o: PrintOptions): T
       break;
     }
     default: {
+      const ext = buildExtTable(kind, objs, !!o.wide, name, A, o.nowMs);
+      if (ext) { headers = ext.headers; rows = ext.rows; break; }
       headers = ['NAME', 'AGE'];
       rows = objs.map((x) => [name(x), A(x)]);
     }

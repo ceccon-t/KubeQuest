@@ -172,6 +172,38 @@ but not required), real-cluster backend, localisation, `-k`, `patch`, `diff`,
 - 2026-10-06: Pause/Restart controls; full-height side panel layout.
 - 2026-10-07: Briefing **lessons** (≤5 paragraphs per mission) tying concept cards to the ticket; content-rule test.
 - 2026-10-07: Per-objective **insights** (senior-engineer commentary unlocked on completion) in a new Insights tab.
+- 2026-11-22: **Full curriculum** (stages 1–8 of `curriculum-full.md`): 28 new missions, 42 in total.
+  Everything §3 deferred except multi-cluster contexts, Challenge mode, sound, a real-cluster backend,
+  localisation, `diff` and `custom-columns` is now in scope and shipped:
+  - *Missions:* 1.2; 3.7–3.8; 4.3–4.6; 5.1–5.7; 6.1–6.6; 7.1–7.5; 8.1–8.3 (see README for titles).
+  - *Kinds:* Secret, ServiceAccount, Role/ClusterRole and bindings, PersistentVolume(Claim),
+    StorageClass, StatefulSet, HorizontalPodAutoscaler, PodDisruptionBudget, ResourceQuota, LimitRange,
+    PriorityClass, NetworkPolicy, Ingress/IngressClass, Gateway API (GatewayClass, Gateway, HTTPRoute),
+    ValidatingAdmissionPolicy(+Binding), CustomResourceDefinition and custom resources.
+  - *API machinery:* RBAC and impersonation, the admission chain (LimitRange, quota, Pod Security
+    Admission, CEL policies), CRD schema validation, finalizers, event aggregation and TTL.
+  - *Workstation tools:* `helm` (v3, local charts), `git` (one branch, one remote), `kubectl kustomize`.
+  - *Add-ons simulated as controllers:* ingress-nginx, Envoy Gateway, Argo CD (Application), a sample
+    operator, Chaos Mesh (PodChaos pod-kill), the NVIDIA device plugin (extended resource only).
+
+### 9c. kubectl command matrix — additions to §2.2
+| Command | Added | Notes |
+|---|---|---|
+| global | `--as`, `--as-group` | authorized through RBAC; upstream Forbidden text |
+| `auth` | `can-i VERB RESOURCE [-n] [--list]`, `whoami` | |
+| `apply` | `-k DIR` | Kustomize build, then apply |
+| `kustomize` | `DIR` | v5.5 subset; unsupported fields fail honestly |
+| `create` | `serviceaccount`, `role`, `clusterrole`, `rolebinding`, `clusterrolebinding`, `secret generic|tls|docker-registry`, `configmap --from-file`, `quota`, `pdb`, `priorityclass`, `ingress`, `service clusterip [--clusterip=None]`, `token`, `job --from=cronjob/…` | |
+| `patch` | `--type strategic|merge|json`, `-p` | |
+| `set` | `resources`, `serviceaccount` | |
+| `autoscale` | `deployment|rs|sts --min --max --cpu-percent` | |
+| `taint` | `nodes NAME key=value:Effect`, `key-` | |
+| `debug` | `POD --image --target [-c] [-it]` (ephemeral container) | |
+| `label`, `annotate` | `--dry-run=server` | runs admission; prints Pod Security warnings |
+| `rollout` | `status`/`restart` for StatefulSet and DaemonSet | |
+| `scale` | StatefulSet | |
+| `drain` | evictions honour PodDisruptionBudgets, `--timeout` | upstream retry line |
+| `get`, `describe` | all kinds above; custom resources with their printer columns | |
 
 ## 10. Delivery status (2026-10-06)
 

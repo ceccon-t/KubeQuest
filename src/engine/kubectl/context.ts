@@ -2,6 +2,7 @@
 import type { Engine } from '../engine.ts';
 import type { Vfs } from '../vfs.ts';
 import type { FlagSpec, ParsedArgs } from './args.ts';
+import type { UserInfo } from '../rbac.ts';
 
 export interface OutputChunk {
   text: string;
@@ -36,6 +37,8 @@ export interface CommandContext {
   cmdline: string;
   /** Piped stdin, when the shell provided one. */
   stdin?: string;
+  /** Who the request is made as: the kubeconfig user, or the identity given with --as / --as-group. */
+  user: UserInfo;
 }
 
 export type CommandRun = (ctx: CommandContext) => AsyncGenerator<OutputChunk, number>;

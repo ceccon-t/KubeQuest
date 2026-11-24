@@ -244,15 +244,18 @@ function syncStatus(engine: Engine, d: Deployment, newRs: ReplicaSet | undefined
   else {
     const deadline = (d.spec.progressDeadlineSeconds ?? 600) * 1000;
     const since = prevProg && prevProg.reason !== 'NewReplicaSetAvailable' && prevProg.lastUpdateTime ? Date.parse(prevProg.lastUpdateTime) : engine.clock.nowMs;
-    const stalled = prevProg?.reason === 'ProgressDeadlineExceeded' || engine.clock.nowMs - since > deadline;
+    // upstream: sync.go syncRolloutStatus — a timed-out rollout stays timed out until progress is seen
+    // (DeploymentProgressing) or a new ReplicaSet is created; approximated by a change in the replica counts.
+    const key = `${newRs?.metadata.name ?? ''}/${replicas}/${updated}/${available}`;
+    const prevKey = engine.scratch.get(`deploy-progress/${d.metadata.uid}`) as string | undefined;
+    engine.scratch.set(`deploy-progress/${d.metadata.uid}`, key);
+    const progressed = prevKey !== undefined && key !== prevKey;
+    const stalled = !progressed && (prevProg?.reason === 'ProgressDeadlineExceeded' || engine.clock.nowMs - since > deadline);
     if (stalled) conds.push(cond('Progressing', 'False', 'ProgressDeadlineExceeded', `ReplicaSet "${newRs?.metadata.name ?? ''}" has timed out progressing.`));
     else {
       const progressing = { ...cond('Progressing', 'True', newRs && (newRs.spec.replicas ?? 0) > 0 ? 'ReplicaSetUpdated' : 'NewReplicaSetCreated', newRs ? `ReplicaSet "${newRs.metadata.name}" is progressing.` : 'Created new replica set') };
-      // keep lastUpdateTime moving only when progress is made (upstream compares status); approximate with replica counts
-      const key = `${replicas}/${updated}/${available}`;
-      const prevKey = engine.scratch.get(`deploy-progress/${d.metadata.uid}`) as string | undefined;
-      if (prevProg && prevProg.reason !== 'NewReplicaSetAvailable' && key === prevKey) progressing.lastUpdateTime = prevProg.lastUpdateTime;
-      engine.scratch.set(`deploy-progress/${d.metadata.uid}`, key);
+      // keep lastUpdateTime moving only when progress is made
+      if (prevProg && prevProg.reason !== 'NewReplicaSetAvailable' && !progressed && prevKey !== undefined) progressing.lastUpdateTime = prevProg.lastUpdateTime;
       conds.push(progressing);
     }
   }

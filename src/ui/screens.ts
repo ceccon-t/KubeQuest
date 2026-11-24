@@ -42,7 +42,6 @@ export function campaignScreen(progress: Progress, opts: { version: string; onPl
   }
   const sb = h('div', { class: 'mcard', role: 'button', tabindex: '0', onclick: () => opts.onPlay(SANDBOX) }, h('div', { class: 'id' }, 'free play'), h('h3', null, 'Sandbox'), h('div', { class: 'tag' }, SANDBOX.tagline), h('div', { class: 'foot' }, h('span', { class: 'muted' }, 'no scoring')));
   el.append(h('section', { class: 'chapter' }, h('h2', null, h('span', null, 'Sandbox')), h('div', { class: 'missions' }, sb)));
-  el.append(h('p', { class: 'muted', style: { fontSize: '12px' } }, 'Chapters 5–8 of the curriculum (configuration, storage, security, production operations, platform) are planned for later releases.'));
   return el;
 }
 

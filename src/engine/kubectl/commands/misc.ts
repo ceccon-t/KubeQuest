@@ -10,6 +10,11 @@ import { podUsage } from '../../controllers/kubelet.ts';
 import { EXPLAIN_DOCS } from '../explain-docs.ts';
 import { COMMAND_MATRIX } from '../help-text.ts';
 import { stringify } from '../../yaml.ts';
+import { access, apiMutate } from '../api.ts';
+import { evictPod } from '../../controllers/policy.ts';
+import { ApiError } from '../../store.ts';
+import { authorizeAccess } from '../resources.ts';
+import { resourceByKind } from '../../registry.ts';
 
 function table(rows: string[][]): string {
   return tabwrite(rows.map((r) => r.join('\t')).join('\n') + '\n', { minwidth: 6, tabwidth: 4, padding: 3 });
@@ -270,8 +275,7 @@ export const cordonCommand: KubectlCommand = {
   run: async function* (ctx: CommandContext): AsyncGenerator<OutputChunk, number> {
     const n = nodeArg(ctx);
     if (n.spec.unschedulable) { yield out(`node/${n.metadata.name} already cordoned\n`); return 0; }
-    n.spec.unschedulable = true;
-    ctx.engine.store.update(n);
+    apiMutate(ctx, n, (d) => { d.spec.unschedulable = true; });
     yield out(`node/${n.metadata.name} cordoned\n`);
     return 0;
   },
@@ -282,8 +286,7 @@ export const uncordonCommand: KubectlCommand = {
   run: async function* (ctx: CommandContext): AsyncGenerator<OutputChunk, number> {
     const n = nodeArg(ctx);
     if (!n.spec.unschedulable) { yield out(`node/${n.metadata.name} already uncordoned\n`); return 0; }
-    delete n.spec.unschedulable;
-    ctx.engine.store.update(n);
+    apiMutate(ctx, n, (d) => { delete d.spec.unschedulable; });
     yield out(`node/${n.metadata.name} uncordoned\n`);
     return 0;
   },
@@ -299,25 +302,41 @@ export const drainCommand: KubectlCommand = {
     const dsPods = pods.filter((p) => p.metadata.ownerReferences?.some((r) => r.kind === 'DaemonSet'));
     const unmanaged = pods.filter((p) => !p.metadata.ownerReferences?.some((r) => r.controller));
     const emptyDir = pods.filter((p) => p.spec.volumes?.some((v) => v.emptyDir !== undefined) && !dsPods.includes(p));
+    // upstream drain filters: fatal ones are reported as `cannot delete <kind> (use --flag …): pods`
     const errs: string[] = [];
     if (dsPods.length && !bool(a, 'ignore-daemonsets')) errs.push(`cannot delete DaemonSet-managed Pods (use --ignore-daemonsets to ignore): ${dsPods.map((p) => `${p.metadata.namespace}/${p.metadata.name}`).join(', ')}`);
-    if (unmanaged.length && !bool(a, 'force')) errs.push(`cannot delete Pods that declare no controller (use --force to override): ${unmanaged.map((p) => `${p.metadata.namespace}/${p.metadata.name}`).join(', ')}`);
+    if (unmanaged.length && !bool(a, 'force')) errs.push(`cannot delete cannot delete Pods that declare no controller (use --force to override): ${unmanaged.map((p) => `${p.metadata.namespace}/${p.metadata.name}`).join(', ')}`);
     if (emptyDir.length && !bool(a, 'delete-emptydir-data') && !bool(a, 'delete-local-data')) errs.push(`cannot delete Pods with local storage (use --delete-emptydir-data to override): ${emptyDir.map((p) => `${p.metadata.namespace}/${p.metadata.name}`).join(', ')}`);
-    if (!n.spec.unschedulable) { n.spec.unschedulable = true; ctx.engine.store.update(n); yield out(`node/${n.metadata.name} cordoned\n`); }
+    if (!n.spec.unschedulable) { apiMutate(ctx, n, (d) => { d.spec.unschedulable = true; }); yield out(`node/${n.metadata.name} cordoned\n`); }
     else yield out(`node/${n.metadata.name} already cordoned\n`);
-    if (errs.length) { yield err(`error: unable to drain node "${n.metadata.name}" due to error: [${errs.join(', ')}], continuing command...\nThere are pending nodes to be drained:\n ${n.metadata.name}\nerror: ${errs.join('\n')}\n`); return 1; }
+    if (errs.length) { yield err(`error: unable to drain node "${n.metadata.name}" due to error: ${errs.length === 1 ? errs[0] : `[${errs.join(', ')}]`}, continuing command...\nThere are pending nodes to be drained:\n ${n.metadata.name}\n${errs.join('\n')}\n`); return 1; }
     const victims = pods.filter((p) => !dsPods.includes(p));
     if (dsPods.length) yield err(`Warning: ignoring DaemonSet-managed Pods: ${dsPods.map((p) => `${p.metadata.namespace}/${p.metadata.name}`).join(', ')}\n`);
+    const podInfo = resourceByKind('Pod');
+    if (podInfo) for (const p of victims) authorizeAccess(ctx.engine, access(ctx), podInfo, 'create', p.metadata.namespace, p.metadata.name, 'eviction');
     for (const p of victims) yield out(`evicting pod ${p.metadata.namespace}/${p.metadata.name}\n`);
     const grace = (a.flags['grace-period'] as number) >= 0 ? (a.flags['grace-period'] as number) : undefined;
-    for (const p of victims) ctx.engine.store.markDeleting(p, grace ?? p.spec.terminationGracePeriodSeconds ?? 30);
-    const pending = new Set(victims);
-    const deadline = ctx.engine.clock.nowMs + (str(a, 'timeout') ? (parseGoDuration(str(a, 'timeout')!) ?? 0) : 10 * 60_000);
-    while (pending.size && !ctx.host.aborted() && ctx.engine.clock.nowMs < deadline) {
-      for (const p of [...pending]) if (!ctx.engine.store.getByUid(p.metadata.uid as string)) { pending.delete(p); yield out(`pod/${p.metadata.name} evicted\n`); }
-      if (pending.size) await ctx.host.sleep(250);
+    // each pod goes through the eviction API, which honours PodDisruptionBudgets; refused evictions are retried every 5s
+    const waiting = new Set(victims);
+    const evicted = new Set<Pod>();
+    const retryAt = new Map<Pod, number>();
+    const deadline = str(a, 'timeout') ? ctx.engine.clock.nowMs + (parseGoDuration(str(a, 'timeout')!) ?? 0) : Infinity;
+    while ((waiting.size || evicted.size) && !ctx.host.aborted() && ctx.engine.clock.nowMs < deadline) {
+      for (const p of [...waiting]) {
+        if ((retryAt.get(p) ?? 0) > ctx.engine.clock.nowMs) continue;
+        const live = ctx.engine.store.getByUid<Pod>(p.metadata.uid as string);
+        if (!live || live.metadata.deletionTimestamp) { waiting.delete(p); evicted.add(p); continue; }
+        try { evictPod(ctx.engine, live, grace); waiting.delete(p); evicted.add(p); }
+        catch (e) {
+          if (!(e instanceof ApiError)) throw e;
+          yield err(`error when evicting pods/"${p.metadata.name}" -n "${p.metadata.namespace}" (will retry after 5s): ${e.message}\n`);
+          retryAt.set(p, ctx.engine.clock.nowMs + 5000);
+        }
+      }
+      for (const p of [...evicted]) if (!ctx.engine.store.getByUid(p.metadata.uid as string)) { evicted.delete(p); yield out(`pod/${p.metadata.name} evicted\n`); }
+      if (waiting.size || evicted.size) await ctx.host.sleep(250);
     }
-    if (pending.size) { yield err(`error: unable to drain node "${n.metadata.name}": global timeout reached\n`); return 1; }
+    if (waiting.size || evicted.size) { yield err(ctx.host.aborted() ? '' : `error: unable to drain node "${n.metadata.name}" due to error: global timeout reached: ${str(a, 'timeout')}, continuing command...\nThere are pending nodes to be drained:\n ${n.metadata.name}\n`); return 1; }
     yield out(`node/${n.metadata.name} drained\n`);
     return 0;
   },

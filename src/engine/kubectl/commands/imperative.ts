@@ -9,6 +9,9 @@ import { parseOutputFlag, renderObjects } from '../output.ts';
 import { ValidationError } from '../validate.ts';
 import { ApiError } from '../../store.ts';
 import { interactiveShell } from '../../container-shell.ts';
+import { apiCreate, apiMutate, access, authorizeWrite, formatApiError, warningChunks } from '../api.ts';
+import { evictPod } from '../../controllers/policy.ts';
+import { admit as admitObject } from '../../admission.ts';
 
 // ---------------------------------------------------------------------------
 // run
@@ -80,8 +83,8 @@ export const runCommand: KubectlCommand = {
     }
     delete pod.metadata.creationTimestamp;
     const admitted = admit(ctx.engine, { obj: pod, source: 'kubectl run' }, ctx.namespace, ctx.namespaceExplicit);
-    try { ctx.engine.store.create(admitted); }
-    catch (e) { if (e instanceof ApiError) throw new KubectlError(`Error from server (${e.reason}): ${e.message}`); throw e; }
+    try { yield* warningChunks(apiCreate(ctx, admitted)); }
+    catch (e) { if (e instanceof ApiError) throw new KubectlError(formatApiError(e)); throw e; }
     const interactive = bool(a, 'stdin') && bool(a, 'tty');
     if (!interactive) {
       if (fmt.kind === 'table') yield out(`pod/${name} created\n`);
@@ -155,7 +158,7 @@ export const deleteCommand: KubectlCommand = {
       const sel = str(a, 'selector');
       if (refs.every((r) => r.name === undefined) && !sel && !bool(a, 'all') && !str(a, 'field-selector')) throw new KubectlError('resource(s) were provided, but no name was specified');
       for (const ref of refs) {
-        try { targets.push(...fetch(ctx.engine, ref, ctx.namespace, allNs, sel, str(a, 'field-selector'))); }
+        try { targets.push(...fetch(ctx.engine, ref, ctx.namespace, allNs, sel, str(a, 'field-selector'), access(ctx, ref.name !== undefined ? 'delete' : 'list'))); }
         catch (e) {
           if (e instanceof KubectlError && e.message.includes('NotFound') && bool(a, 'ignore-not-found')) continue;
           if (e instanceof KubectlError && e.message.includes('NotFound')) { yield err(e.message + '\n'); return 1; }
@@ -177,6 +180,7 @@ export const deleteCommand: KubectlCommand = {
     for (const o of targets) {
       const qn = qualifiedName(o.kind, o.metadata.name);
       if (dry && dry !== 'none') { yield out(`${o.kind.toLowerCase()} "${o.metadata.name}" deleted (${dry === 'server' ? 'server dry run' : 'dry run'})\n`); continue; }
+      authorizeWrite(ctx, 'delete', o);
       if (cascade === 'orphan') {
         for (const dep of ctx.engine.store.all()) {
           if (dep.metadata.ownerReferences?.some((r) => r.uid === o.metadata.uid)) {
@@ -201,10 +205,13 @@ export const deleteCommand: KubectlCommand = {
           if (dep.kind === 'Pod') ctx.engine.store.markDeleting(dep, (dep as Pod).spec.terminationGracePeriodSeconds ?? 30);
           else ctx.engine.store.remove(dep);
         }
+      } else if (o.metadata.finalizers?.length) {
+        // finalizers (pvc-protection…) hold the object in Terminating until their controller releases it
+        ctx.engine.store.markDeleting(o, 0);
       } else {
         ctx.engine.store.remove(o);
       }
-      const label = o.kind === 'Pod' || o.kind === 'Namespace' || o.kind === 'Service' || o.kind === 'Node' || o.kind === 'ConfigMap' || o.kind === 'Secret' || o.kind === 'Event' || o.kind === 'Endpoints' ? o.kind.toLowerCase() : qn.split('/')[0];
+      const label = o.kind === 'Pod' || o.kind === 'Namespace' || o.kind === 'Service' || o.kind === 'Node' || o.kind === 'ConfigMap' || o.kind === 'Secret' || o.kind === 'Event' || o.kind === 'Endpoints' || o.kind === 'PersistentVolumeClaim' || o.kind === 'PersistentVolume' || o.kind === 'ServiceAccount' || o.kind === 'ResourceQuota' || o.kind === 'LimitRange' ? o.kind.toLowerCase() : qn.split('/')[0];
       yield out(`${label} "${o.metadata.name}"${grace === 0 && o.kind === 'Pod' ? ' force deleted' : ' deleted'}\n`);
     }
     if (bool(a, 'wait') && !(dry && dry !== 'none')) {
@@ -253,9 +260,9 @@ export const scaleCommand: KubectlCommand = {
       if (a.positional.length === 0) throw new KubectlError('resource(s) were provided, but no name was specified');
       const refs = parseResourceArgs(a.positional);
       for (const ref of refs) {
-        if (!['Deployment', 'ReplicaSet', 'StatefulSet', 'ReplicationController'].includes(ref.info.kind)) throw new KubectlError(`the server doesn't have a resource type "${ref.info.plural}" that can be scaled`);
+        if (!['Deployment', 'ReplicaSet', 'StatefulSet'].includes(ref.info.kind)) throw new KubectlError(`the server doesn't have a resource type "${ref.info.plural}" that can be scaled`);
         if (ref.name === undefined && !str(a, 'selector') && !bool(a, 'all')) throw new KubectlError('resource(s) were provided, but no name was specified');
-        targets = targets.concat(fetch(ctx.engine, ref, ctx.namespace, false, str(a, 'selector')));
+        targets = targets.concat(fetch(ctx.engine, ref, ctx.namespace, false, str(a, 'selector'), undefined, access(ctx)));
       }
     }
     const dry = str(a, 'dry-run');
@@ -264,8 +271,8 @@ export const scaleCommand: KubectlCommand = {
       const spec = o.spec as { replicas?: number };
       if (cur !== undefined && (spec.replicas ?? 1) !== cur) throw new KubectlError(`Expected replicas to be ${cur}, was ${spec.replicas ?? 1}`);
       if (!(dry && dry !== 'none')) {
-        spec.replicas = replicas;
-        ctx.engine.store.update(o, { specChanged: true });
+        try { yield* warningChunks(apiMutate(ctx, o, (d) => { (d.spec as { replicas?: number }).replicas = replicas; }, { specChanged: true, subresource: 'scale' })); }
+        catch (e) { if (e instanceof ApiError) throw new KubectlError(formatApiError(e)); throw e; }
       }
       yield out(`${qualifiedName(o.kind, o.metadata.name)} scaled${dry && dry !== 'none' ? ' (dry run)' : ''}\n`);
     }
@@ -321,7 +328,7 @@ function makeMetaEditor(name: 'label' | 'annotate', field: 'labels' | 'annotatio
       const objs: KubeObject[] = [];
       for (const r of refs) {
         if (r.name === undefined && !str(a, 'selector') && !bool(a, 'all')) throw new KubectlError('resource(s) were provided, but no name was specified');
-        objs.push(...fetch(ctx.engine, r, ctx.namespace, bool(a, 'all-namespaces'), str(a, 'selector'), str(a, 'field-selector')));
+        objs.push(...fetch(ctx.engine, r, ctx.namespace, bool(a, 'all-namespaces'), str(a, 'selector'), str(a, 'field-selector'), access(ctx)));
       }
       if (name === 'label') {
         for (const [k, v] of Object.entries(set)) {
@@ -331,7 +338,7 @@ function makeMetaEditor(name: 'label' | 'annotate', field: 'labels' | 'annotatio
       }
       const dry = str(a, 'dry-run');
       for (const o of objs) {
-        const m = (o.metadata[field] ?? {}) as Record<string, string>;
+        const m = { ...((o.metadata[field] ?? {}) as Record<string, string>) };
         if (bool(a, 'list')) { yield out(`Listing ${field} for ${o.kind}/${o.metadata.name}:\n` + Object.entries(m).map(([k, v]) => ` ${k}=${v}\n`).join('')); continue; }
         let changed = false;
         for (const [k, v] of Object.entries(set)) {
@@ -340,10 +347,16 @@ function makeMetaEditor(name: 'label' | 'annotate', field: 'labels' | 'annotatio
         }
         for (const k of remove) if (m[k] !== undefined) { delete m[k]; changed = true; }
         if (changed && !(dry && dry !== 'none')) {
-          if (Object.keys(m).length) o.metadata[field] = m; else delete o.metadata[field];
-          ctx.engine.store.update(o);
+          try { yield* warningChunks(apiMutate(ctx, o, (d) => { if (Object.keys(m).length) d.metadata[field] = m; else delete d.metadata[field]; })); }
+          catch (e) { if (e instanceof ApiError) throw new KubectlError(formatApiError(e)); throw e; }
+        } else if (changed && dry === 'server') {
+          // a server-side dry run goes through admission without persisting: this is how a Pod Security level is previewed
+          const draft = structuredClone(o);
+          if (Object.keys(m).length) draft.metadata[field] = m; else delete draft.metadata[field];
+          try { yield* warningChunks(admitObject(ctx.engine, draft, 'UPDATE', { user: ctx.user, old: o })); }
+          catch (e) { if (e instanceof ApiError) throw new KubectlError(formatApiError(e)); throw e; }
         }
-        yield out(`${qualifiedName(o.kind, o.metadata.name)} ${changed ? verb : `not ${verb}`}${dry && dry !== 'none' ? ' (dry run)' : ''}\n`);
+        yield out(`${qualifiedName(o.kind, o.metadata.name)} ${changed ? verb : `not ${verb}`}${dry && dry !== 'none' ? (dry === 'server' ? ' (server dry run)' : ' (dry run)') : ''}\n`);
       }
       return 0;
     },
@@ -382,7 +395,7 @@ export const exposeCommand: KubectlCommand = {
     if (refs.length !== 1 || refs[0]!.name === undefined) throw new KubectlError('resource(s) were provided, but no name was specified');
     const ref = refs[0]!;
     if (!['Deployment', 'ReplicaSet', 'Pod', 'Service'].includes(ref.info.kind)) throw new KubectlError(`cannot expose a ${ref.info.kind}`);
-    const target = fetch(ctx.engine, ref, ctx.namespace, false)[0] as KubeObject;
+    const target = fetch(ctx.engine, ref, ctx.namespace, false, undefined, undefined, access(ctx))[0] as KubeObject;
     let selector: Record<string, string> = {};
     let containerPorts: { containerPort: number; protocol?: string; name?: string }[] = [];
     switch (target.kind) {
@@ -429,11 +442,11 @@ export const exposeCommand: KubectlCommand = {
     delete svc.metadata.creationTimestamp;
     try {
       const admitted = admit(ctx.engine, { obj: svc, source: 'kubectl expose' }, ctx.namespace, ctx.namespaceExplicit);
-      ctx.engine.store.create(admitted);
+      yield* warningChunks(apiCreate(ctx, admitted));
       if (fmt.kind === 'table') yield out(`service/${svcName} exposed\n`);
       else yield out(renderObjects(fmt, [admitted], true));
     } catch (e) {
-      if (e instanceof ApiError) throw new KubectlError(`Error from server (${e.reason}): ${e.message}`);
+      if (e instanceof ApiError) throw new KubectlError(formatApiError(e));
       if (e instanceof ValidationError) throw new KubectlError(`The ${e.message}`);
       throw e;
     }
@@ -441,3 +454,5 @@ export const exposeCommand: KubectlCommand = {
     return 0;
   },
 };
+
+void evictPod;

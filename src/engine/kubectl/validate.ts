@@ -3,6 +3,8 @@ import type { KubeObject, PodSpec, Container, Probe } from '../types.ts';
 import { resourceByKind, resolveResource, apiVersionOf } from '../registry.ts';
 import { parseQuantity, parseMemoryBytes, parseCpuMillis } from '../duration.ts';
 import { fromLabelSelector, matches } from '../selector.ts';
+import { checkCel } from '../cel.ts';
+import { KubectlError } from './args.ts';
 
 export class ValidationError extends Error {}
 
@@ -28,6 +30,15 @@ const SCHEMA: Record<string, string[]> = {
   ServiceSpec: ['ports', 'selector', 'clusterIP', 'clusterIPs', 'type', 'externalIPs', 'sessionAffinity', 'loadBalancerIP', 'loadBalancerSourceRanges', 'externalName', 'externalTrafficPolicy', 'healthCheckNodePort', 'publishNotReadyAddresses', 'sessionAffinityConfig', 'ipFamilies', 'ipFamilyPolicy', 'allocateLoadBalancerNodePorts', 'loadBalancerClass', 'internalTrafficPolicy', 'trafficDistribution'],
   ServicePort: ['name', 'protocol', 'appProtocol', 'port', 'targetPort', 'nodePort'],
   PodTemplateSpec: ['metadata', 'spec'],
+  StatefulSetSpec: ['replicas', 'selector', 'template', 'volumeClaimTemplates', 'serviceName', 'podManagementPolicy', 'updateStrategy', 'revisionHistoryLimit', 'minReadySeconds', 'persistentVolumeClaimRetentionPolicy', 'ordinals'],
+  IngressSpec: ['ingressClassName', 'defaultBackend', 'tls', 'rules'],
+  NetworkPolicySpec: ['podSelector', 'ingress', 'egress', 'policyTypes'],
+  PersistentVolumeClaimSpec: ['accessModes', 'selector', 'resources', 'volumeName', 'storageClassName', 'volumeMode', 'dataSource', 'dataSourceRef', 'volumeAttributesClassName'],
+  HorizontalPodAutoscalerSpec: ['scaleTargetRef', 'minReplicas', 'maxReplicas', 'metrics', 'behavior'],
+  PodDisruptionBudgetSpec: ['minAvailable', 'selector', 'maxUnavailable', 'unhealthyPodEvictionPolicy'],
+  SecurityContext: ['capabilities', 'privileged', 'seLinuxOptions', 'windowsOptions', 'runAsUser', 'runAsGroup', 'runAsNonRoot', 'readOnlyRootFilesystem', 'allowPrivilegeEscalation', 'procMount', 'seccompProfile', 'appArmorProfile'],
+  PodSecurityContext: ['seLinuxOptions', 'windowsOptions', 'runAsUser', 'runAsGroup', 'runAsNonRoot', 'supplementalGroups', 'supplementalGroupsPolicy', 'fsGroup', 'sysctls', 'fsGroupChangePolicy', 'seccompProfile', 'appArmorProfile', 'seLinuxChangePolicy'],
+  VolumeMount: ['name', 'readOnly', 'recursiveReadOnly', 'mountPath', 'subPath', 'mountPropagation', 'subPathExpr'],
   LabelSelector: ['matchLabels', 'matchExpressions'],
   DeploymentStrategy: ['type', 'rollingUpdate'],
 };
@@ -36,6 +47,8 @@ const SCHEMA_PKG: Record<string, string> = {
   ObjectMeta: 'io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta', PodSpec: 'io.k8s.api.core.v1.PodSpec', Container: 'io.k8s.api.core.v1.Container', Probe: 'io.k8s.api.core.v1.Probe',
   ResourceRequirements: 'io.k8s.api.core.v1.ResourceRequirements', ContainerPort: 'io.k8s.api.core.v1.ContainerPort', EnvVar: 'io.k8s.api.core.v1.EnvVar', DeploymentSpec: 'io.k8s.api.apps.v1.DeploymentSpec',
   ReplicaSetSpec: 'io.k8s.api.apps.v1.ReplicaSetSpec', DaemonSetSpec: 'io.k8s.api.apps.v1.DaemonSetSpec', JobSpec: 'io.k8s.api.batch.v1.JobSpec', CronJobSpec: 'io.k8s.api.batch.v1.CronJobSpec',
+  StatefulSetSpec: 'io.k8s.api.apps.v1.StatefulSetSpec', IngressSpec: 'io.k8s.api.networking.v1.IngressSpec', NetworkPolicySpec: 'io.k8s.api.networking.v1.NetworkPolicySpec', PersistentVolumeClaimSpec: 'io.k8s.api.core.v1.PersistentVolumeClaimSpec',
+  HorizontalPodAutoscalerSpec: 'io.k8s.api.autoscaling.v2.HorizontalPodAutoscalerSpec', PodDisruptionBudgetSpec: 'io.k8s.api.policy.v1.PodDisruptionBudgetSpec', SecurityContext: 'io.k8s.api.core.v1.SecurityContext', PodSecurityContext: 'io.k8s.api.core.v1.PodSecurityContext', VolumeMount: 'io.k8s.api.core.v1.VolumeMount',
   ServiceSpec: 'io.k8s.api.core.v1.ServiceSpec', ServicePort: 'io.k8s.api.core.v1.ServicePort', PodTemplateSpec: 'io.k8s.api.core.v1.PodTemplateSpec', LabelSelector: 'io.k8s.apimachinery.pkg.apis.meta.v1.LabelSelector', DeploymentStrategy: 'io.k8s.api.apps.v1.DeploymentStrategy',
 };
 
@@ -59,6 +72,8 @@ function checkContainers(kind: string, path: string, containers: unknown): void 
     if (cc.resources) checkFields(kind, `${path}[${i}].resources`, cc.resources, 'ResourceRequirements');
     if (Array.isArray(cc.ports)) cc.ports.forEach((p, j) => checkFields(kind, `${path}[${i}].ports[${j}]`, p, 'ContainerPort'));
     if (Array.isArray(cc.env)) cc.env.forEach((e, j) => checkFields(kind, `${path}[${i}].env[${j}]`, e, 'EnvVar'));
+    if (cc.securityContext) checkFields(kind, `${path}[${i}].securityContext`, cc.securityContext, 'SecurityContext');
+    if (Array.isArray(cc.volumeMounts)) cc.volumeMounts.forEach((m, j) => checkFields(kind, `${path}[${i}].volumeMounts[${j}]`, m, 'VolumeMount'));
   });
 }
 
@@ -67,6 +82,7 @@ function checkPodSpec(kind: string, path: string, spec: unknown): void {
   const s = spec as PodSpec;
   checkContainers(kind, `${path}.containers`, s?.containers);
   checkContainers(kind, `${path}.initContainers`, s?.initContainers);
+  if (s?.securityContext) checkFields(kind, `${path}.securityContext`, s.securityContext, 'PodSecurityContext');
 }
 
 /** Structural validation (unknown/missing fields) — produces `error validating data` errors. */
@@ -78,8 +94,12 @@ export function validateStructure(obj: KubeObject, source: string): void {
     case 'Pod':
       checkPodSpec(kind, 'spec', spec);
       break;
+    case 'Ingress': case 'NetworkPolicy': case 'PersistentVolumeClaim': case 'HorizontalPodAutoscaler': case 'PodDisruptionBudget':
+      checkFields(kind, 'spec', spec, `${kind}Spec`);
+      break;
     case 'Deployment':
     case 'ReplicaSet':
+    case 'StatefulSet':
     case 'DaemonSet': {
       checkFields(kind, 'spec', spec, `${kind}Spec`);
       if (spec?.template) { checkFields(kind, 'spec.template', spec.template, 'PodTemplateSpec'); checkPodSpec(kind, 'spec.template.spec', (spec.template as { spec?: unknown }).spec); }
@@ -171,6 +191,16 @@ function validateLabels(path: string, labels: Record<string, string> | undefined
 }
 
 /** Semantic validation — produces `The Kind "name" is invalid:` errors. */
+/** Every field the manifest states is already so in the live object (which also carries defaults the manifest omits). */
+function isSubset(want: unknown, live: unknown): boolean {
+  if (Array.isArray(want)) return Array.isArray(live) && live.length === want.length && want.every((w, i) => isSubset(w, live[i]));
+  if (want && typeof want === 'object') {
+    if (!live || typeof live !== 'object' || Array.isArray(live)) return Object.keys(want).length === 0;
+    return Object.entries(want as Record<string, unknown>).every(([k, v]) => v === null || v === undefined || isSubset(v, (live as Record<string, unknown>)[k]));
+  }
+  return want === live || String(want) === String(live);
+}
+
 export function validateObject(obj: KubeObject, existing?: KubeObject): void {
   const kind = obj.kind;
   const errs: string[] = [];
@@ -189,6 +219,7 @@ export function validateObject(obj: KubeObject, existing?: KubeObject): void {
     }
     case 'Deployment':
     case 'ReplicaSet':
+    case 'StatefulSet':
     case 'DaemonSet': {
       if (!spec) { errs.push('spec: Required value'); break; }
       const selector = spec.selector as { matchLabels?: Record<string, string>; matchExpressions?: unknown[] } | undefined;
@@ -209,6 +240,11 @@ export function validateObject(obj: KubeObject, existing?: KubeObject): void {
         validatePodSpec('spec.template.spec', template.spec, errs, kind === 'DaemonSet' ? ['Always'] : ['Always']);
       }
       if (spec.replicas !== undefined && (typeof spec.replicas !== 'number' || spec.replicas < 0 || !Number.isInteger(spec.replicas))) errs.push(`spec.replicas: Invalid value: ${spec.replicas}: must be greater than or equal to 0`);
+      if (existing && kind === 'StatefulSet') {
+        // upstream: apps/validation ValidateStatefulSetUpdate — everything but a handful of fields is immutable
+        const frozen = (x: Record<string, unknown> | undefined) => JSON.stringify({ selector: x?.selector, serviceName: x?.serviceName, podManagementPolicy: x?.podManagementPolicy ?? 'OrderedReady', vct: ((x?.volumeClaimTemplates ?? []) as { metadata?: { name?: string }; spec?: { accessModes?: unknown; resources?: unknown; storageClassName?: unknown } }[]).map((t) => [t.metadata?.name, t.spec?.accessModes, t.spec?.resources, t.spec?.storageClassName ?? null]) });
+        if (frozen(existing.spec as Record<string, unknown>) !== frozen(spec)) { errs.push("spec: Forbidden: updates to statefulset spec for fields other than 'replicas', 'ordinals', 'template', 'updateStrategy', 'persistentVolumeClaimRetentionPolicy' and 'minReadySeconds' are forbidden"); break; }
+      }
       if (existing && selector && JSON.stringify(existing.spec && (existing.spec as Record<string, unknown>).selector) !== JSON.stringify(selector)) {
         const ml = selector.matchLabels ?? {};
         errs.push(`spec.selector: Invalid value: v1.LabelSelector{MatchLabels:map[string]string{${Object.entries(ml).map(([k, v]) => `"${k}":"${v}"`).join(', ')}}, MatchExpressions:[]v1.LabelSelectorRequirement(nil)}: field is immutable`);
@@ -220,6 +256,9 @@ export function validateObject(obj: KubeObject, existing?: KubeObject): void {
       const template = spec.template as { spec?: PodSpec } | undefined;
       if (!template) errs.push('spec.template: Required value');
       else validatePodSpec('spec.template.spec', template.spec, errs, ['OnFailure', 'Never']);
+      // upstream: batch/validation ValidateJobUpdate — spec.template is immutable. The real message dumps the whole
+      // Go struct (core.PodTemplateSpec{ObjectMeta:…, Spec:…}); it is abbreviated here, the rest is verbatim.
+      if (existing && template && !isSubset(template, (existing.spec as Record<string, unknown> | undefined)?.template)) errs.push('spec.template: Invalid value: core.PodTemplateSpec{…}: field is immutable');
       break;
     }
     case 'CronJob': {
@@ -235,7 +274,7 @@ export function validateObject(obj: KubeObject, existing?: KubeObject): void {
       const type = (spec.type as string | undefined) ?? 'ClusterIP';
       if (!['ClusterIP', 'NodePort', 'LoadBalancer', 'ExternalName'].includes(type)) errs.push(`spec.type: Unsupported value: "${type}": supported values: "ClusterIP", "ExternalName", "LoadBalancer", "NodePort"`);
       const ports = spec.ports as { name?: string; port?: number; targetPort?: unknown; nodePort?: number; protocol?: string }[] | undefined;
-      if (type !== 'ExternalName' && (!ports || ports.length === 0)) errs.push('spec.ports: Required value');
+      if (type !== 'ExternalName' && spec.clusterIP !== 'None' && (!ports || ports.length === 0)) errs.push('spec.ports: Required value');
       (ports ?? []).forEach((p, i) => {
         if (p.port === undefined) errs.push(`spec.ports[${i}].port: Required value`);
         else if (typeof p.port !== 'number' || p.port < 1 || p.port > 65535) errs.push(`spec.ports[${i}].port: Invalid value: ${p.port}: must be between 1 and 65535, inclusive`);
@@ -244,6 +283,93 @@ export function validateObject(obj: KubeObject, existing?: KubeObject): void {
         if (p.nodePort !== undefined && (p.nodePort < 30000 || p.nodePort > 32767)) errs.push(`spec.ports[${i}].nodePort: Invalid value: ${p.nodePort}: provided port is not in the valid range. The range of valid ports is 30000-32767`);
       });
       if (spec.selector) validateLabels('spec.selector', spec.selector as Record<string, string>, errs);
+      break;
+    }
+    case 'Ingress': {
+      if (!spec) { errs.push('spec: Required value'); break; }
+      const rules = (spec.rules ?? []) as { http?: { paths?: { path?: string; pathType?: string; backend?: { service?: { name?: string; port?: { number?: number; name?: string } } } }[] } }[];
+      if (!rules.length && !spec.defaultBackend) errs.push('spec: Invalid value: []networking.IngressRule(nil): either `defaultBackend` or `rules` must be specified');
+      rules.forEach((r, i) => (r.http?.paths ?? []).forEach((p, j) => {
+        const at = `spec.rules[${i}].http.paths[${j}]`;
+        if (!p.pathType) errs.push(`${at}.pathType: Required value: pathType must be specified`);
+        else if (!['Exact', 'Prefix', 'ImplementationSpecific'].includes(p.pathType)) errs.push(`${at}.pathType: Unsupported value: "${p.pathType}": supported values: "Exact", "ImplementationSpecific", "Prefix"`);
+        if ((p.pathType === 'Exact' || p.pathType === 'Prefix') && !(p.path ?? '').startsWith('/')) errs.push(`${at}.path: Invalid value: "${p.path ?? ''}": must be an absolute path`);
+        if (!p.backend?.service?.name) errs.push(`${at}.backend.service.name: Required value`);
+        else if (p.backend.service.port?.number === undefined && !p.backend.service.port?.name) errs.push(`${at}.backend: Invalid value: "": cannot set both port name & port number`.replace('Invalid value: "": cannot set both port name & port number', 'Required value: port name or number is required'));
+      }));
+      break;
+    }
+    case 'NetworkPolicy': {
+      if (!spec) { errs.push('spec: Required value'); break; }
+      for (const [i, t] of ((spec.policyTypes ?? []) as string[]).entries()) if (t !== 'Ingress' && t !== 'Egress') errs.push(`spec.policyTypes[${i}]: Unsupported value: "${t}": supported values: "Egress", "Ingress"`);
+      break;
+    }
+    case 'PersistentVolumeClaim': {
+      if (!spec) { errs.push('spec: Required value'); break; }
+      const modes = (spec.accessModes ?? []) as string[];
+      if (!modes.length) errs.push('spec.accessModes: Required value: at least 1 access mode is required');
+      for (const m of modes) if (!['ReadWriteOnce', 'ReadOnlyMany', 'ReadWriteMany', 'ReadWriteOncePod'].includes(m)) errs.push(`spec.accessModes: Unsupported value: "${m}": supported values: "ReadOnlyMany", "ReadWriteMany", "ReadWriteOnce", "ReadWriteOncePod"`);
+      const storage = (spec.resources as { requests?: Record<string, string> } | undefined)?.requests?.storage;
+      if (storage === undefined) errs.push('spec.resources[storage]: Required value');
+      else { try { parseQuantity(storage); } catch (e) { errs.push(`spec.resources[storage]: Invalid value: "${storage}": ${(e as Error).message}`); } }
+      if (existing) {
+        const old = (existing.spec ?? {}) as Record<string, unknown>;
+        // Defaulted fields the manifest may omit are not changes; everything else but the size is immutable.
+        // A class that the previous `kubectl apply` set and this one drops IS a change (the three-way patch removes it).
+        // upstream appends a Go diff of core.PersistentVolumeClaimSpec to this message; that part is not reproduced.
+        let appliedClass: unknown;
+        try { appliedClass = (JSON.parse(existing.metadata.annotations?.['kubectl.kubernetes.io/last-applied-configuration'] ?? '{}') as { spec?: { storageClassName?: unknown } }).spec?.storageClassName; } catch { appliedClass = undefined; }
+        const norm = (x: Record<string, unknown>) => JSON.stringify({ accessModes: x.accessModes, storageClassName: x.storageClassName ?? (x !== old && appliedClass !== undefined ? null : old.storageClassName), volumeMode: x.volumeMode ?? 'Filesystem', selector: x.selector });
+        if (norm(old) !== norm(spec)) errs.push('spec: Forbidden: spec is immutable after creation except resources.requests and volumeAttributesClassName for bound claims');
+      }
+      break;
+    }
+    case 'HorizontalPodAutoscaler': {
+      if (!spec) { errs.push('spec: Required value'); break; }
+      const ref = spec.scaleTargetRef as { kind?: string; name?: string } | undefined;
+      if (!ref?.kind) errs.push('spec.scaleTargetRef.kind: Required value');
+      if (!ref?.name) errs.push('spec.scaleTargetRef.name: Required value');
+      const min = (spec.minReplicas as number | undefined) ?? 1, max = spec.maxReplicas as number | undefined;
+      if (max === undefined || max < 1) errs.push(`spec.maxReplicas: Invalid value: ${max ?? 0}: must be greater than 0`);
+      else if (max < min) errs.push(`spec.maxReplicas: Invalid value: ${max}: must be greater than or equal to \`minReplicas\``);
+      break;
+    }
+    case 'PodDisruptionBudget': {
+      if (!spec) { errs.push('spec: Required value'); break; }
+      if (spec.minAvailable !== undefined && spec.maxUnavailable !== undefined) errs.push('spec: Invalid value: "": minAvailable and maxUnavailable cannot be both set');
+      break;
+    }
+    case 'Role': case 'ClusterRole': {
+      ((obj.rules ?? []) as { verbs?: string[]; apiGroups?: string[]; resources?: string[]; nonResourceURLs?: string[] }[]).forEach((r, i) => {
+        if (!r.verbs?.length) errs.push(`rules[${i}].verbs: Required value: verbs must contain at least one value`);
+        if (!r.nonResourceURLs?.length) {
+          if (!r.apiGroups?.length) errs.push(`rules[${i}].apiGroups: Required value: resource rules must supply at least one api group`);
+          if (!r.resources?.length) errs.push(`rules[${i}].resources: Required value: resource rules must supply at least one resource`);
+        }
+      });
+      break;
+    }
+    case 'RoleBinding': case 'ClusterRoleBinding': {
+      const ref = obj.roleRef as { kind?: string; name?: string } | undefined;
+      if (!ref?.name) errs.push('roleRef.name: Required value');
+      if (ref && !['Role', 'ClusterRole'].includes(ref.kind ?? '')) errs.push(`roleRef.kind: Unsupported value: "${ref.kind ?? ''}": supported values: "ClusterRole", "Role"`);
+      else if (kind === 'ClusterRoleBinding' && ref?.kind === 'Role') errs.push('roleRef.kind: Unsupported value: "Role": supported values: "ClusterRole"');
+      if (existing && JSON.stringify(existing.roleRef) !== JSON.stringify(ref)) errs.push(`roleRef: Invalid value: rbac.RoleRef{APIGroup:"rbac.authorization.k8s.io", Kind:"${ref?.kind ?? ''}", Name:"${ref?.name ?? ''}"}: cannot change roleRef`);
+      ((obj.subjects ?? []) as { kind?: string; name?: string; namespace?: string }[]).forEach((sub, i) => {
+        if (!sub.name) errs.push(`subjects[${i}].name: Required value`);
+        if (!['User', 'Group', 'ServiceAccount'].includes(sub.kind ?? '')) errs.push(`subjects[${i}].kind: Unsupported value: "${sub.kind ?? ''}": supported values: "ServiceAccount", "User", "Group"`);
+        else if (sub.kind === 'ServiceAccount' && kind === 'ClusterRoleBinding' && !sub.namespace) errs.push(`subjects[${i}].namespace: Required value`);
+      });
+      break;
+    }
+    case 'PriorityClass':
+      if (typeof obj.value !== 'number') errs.push('value: Required value');
+      break;
+    case 'ValidatingAdmissionPolicy': {
+      ((spec?.validations ?? []) as { expression?: string }[]).forEach((v, i) => {
+        if (!v.expression) { errs.push(`spec.validations[${i}].expression: Required value: expression is not specified`); return; }
+        try { checkCel(v.expression); } catch (e) { errs.push(`spec.validations[${i}].expression: Invalid value: ${JSON.stringify(v.expression)}: compilation failed: ERROR: <input>: ${(e as Error).message}`); }
+      });
       break;
     }
     case 'Namespace':
@@ -259,10 +385,10 @@ export function validateObject(obj: KubeObject, existing?: KubeObject): void {
 export function resolveKind(obj: KubeObject, source: string): { kind: string; apiVersion: string } {
   const kind = obj.kind;
   const apiVersion = obj.apiVersion;
-  if (!kind || !apiVersion) throw new ValidationError(`error validating "${source}": error validating data: ${!apiVersion ? 'apiVersion not set' : 'kind not set'}; if you choose to ignore these errors, turn validation off with --validate=false`);
+  if (!kind || !apiVersion) throw new KubectlError(`error validating "${source}": error validating data: ${!apiVersion ? 'apiVersion not set' : 'kind not set'}; if you choose to ignore these errors, turn validation off with --validate=false`);
   const r = resolveResource(String(kind)) ?? resourceByKind(String(kind));
   if (!r || r.kind !== kind || apiVersionOf(r) !== apiVersion) {
-    throw new ValidationError(`resource mapping not found for name: "${obj.metadata?.name ?? ''}" namespace: "${obj.metadata?.namespace ?? ''}" from "${source}": no matches for kind "${kind}" in version "${apiVersion}"\nensure CRDs are installed first`);
+    throw new KubectlError(`resource mapping not found for name: "${obj.metadata?.name ?? ''}" namespace: "${obj.metadata?.namespace ?? ''}" from "${source}": no matches for kind "${kind}" in version "${apiVersion}"\nensure CRDs are installed first`);
   }
   return { kind: r.kind, apiVersion };
 }

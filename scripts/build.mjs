@@ -35,6 +35,7 @@ await build({ entryPoints: [path.join(root, 'src/desktop/main.ts')], bundle: tru
 await build({ entryPoints: [path.join(root, 'src/desktop/preload.ts')], bundle: true, platform: 'node', format: 'cjs', target: ['node20'], external: ['electron'], outfile: path.join(dist, 'desktop/preload.cjs'), logLevel: 'warning', define });
 
 const size = (await stat(path.join(dist, 'web/app.js'))).size;
-const budget = 600 * 1024;
+// 1400 KB since the campaign covers the full curriculum (42 missions); see docs/TECH_SPEC.md §9 for the reasoning.
+const budget = 1400 * 1024;
 console.log(`build ok: dist/web/app.js ${(size / 1024).toFixed(0)} KB (budget ${budget / 1024} KB)${size > budget ? '  ⚠ over budget' : ''}`);
 void ui;

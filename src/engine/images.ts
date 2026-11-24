@@ -58,6 +58,34 @@ export interface ContainerBehaviour {
   hasShell?: boolean;
   /** Which env var names the process prints in its start logs (teaching aid). */
   echoEnv?: string[];
+  /** The process is a cluster controller the simulator implements natively (status sync, GitOps reconcile…). */
+  controller?: 'ingress-nginx' | 'envoy-gateway' | 'argocd';
+  /** This container is an L7 proxy whose answers come from Ingress / Gateway API objects, not from `http`. */
+  proxy?: 'ingress-nginx' | 'envoy-gateway';
+  /** Requests per second one replica serves before it sheds load (HPA lessons). */
+  capacityRps?: number;
+  /** Extra CPU (millicores) burnt per request/second of load. */
+  cpuPerRequestMillis?: number;
+  /** The image's USER is root (uid 0): `runAsNonRoot: true` refuses to start it. Default: true unless `user` is set. */
+  user?: number;
+  /** Paths the process writes at start; with `readOnlyRootFilesystem` they must be volume mounts. */
+  writesTo?: string[];
+  /** The registry requires credentials to pull this image (imagePullSecrets). */
+  private?: { username: string; password: string };
+  /** Kubernetes API calls the process needs (RBAC lessons): it logs `forbidden` and stays unready until its ServiceAccount may make them. */
+  apiAccess?: { verb: string; group?: string; resource: string; namespace?: string }[];
+  /** Services the process must resolve and reach at start, else it exits 1 (init-container wait pattern, dependency checks). */
+  requiresService?: string[];
+  /** The process appends its log lines to this file instead of stdout (legacy apps; sidecar lessons). */
+  logFile?: string;
+  /** A datastore: keeps a record count in `path/file`; on start it recovers it when the path is a persistent mount. */
+  stateful?: { path: string; file: string; unit: string; everyMs?: number };
+  /** HTTP paths that call another service before answering: path → `service[:port][/path]`; a failed call yields 502. */
+  upstreams?: Record<string, string>;
+  /** Content digest of this build (two builds pushed under one tag differ here). Derived from the name when omitted. */
+  digest?: string;
+  /** A shell image (busybox-like): when the container has a command it is run as a script. */
+  interpreter?: boolean;
   /** Human description shown by the game's `help images`. */
   description?: string;
   /** Hidden message in logs that explains a failure (missions rely on it). */
@@ -138,13 +166,13 @@ export function baseCatalog(): ImageCatalog {
       logs: { start: ['/docker-entrypoint.sh: Configuration complete; ready for start up'] },
     },
     'busybox:1.36': {
-      ports: [], memoryMiB: 4, cpuMillis: 1, startMs: 100, sizeBytes: 2_200_000,
+      ports: [], memoryMiB: 4, cpuMillis: 1, startMs: 100, sizeBytes: 2_200_000, interpreter: true,
       runToCompletion: { durationMs: 50, exitCode: 0 },
       logs: {},
       description: 'busybox: exits immediately unless given a command (sleep/sh).',
     },
     'busybox:latest': {
-      ports: [], memoryMiB: 4, cpuMillis: 1, startMs: 100, sizeBytes: 2_200_000,
+      ports: [], memoryMiB: 4, cpuMillis: 1, startMs: 100, sizeBytes: 2_200_000, interpreter: true,
       runToCompletion: { durationMs: 50, exitCode: 0 },
       logs: {},
     },
@@ -152,6 +180,22 @@ export function baseCatalog(): ImageCatalog {
       ports: [6379], memoryMiB: 20, cpuMillis: 10, startMs: 500, sizeBytes: 41_000_000,
       logs: { start: ['1:C 05 Oct 2026 09:12:00.000 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo', '1:M 05 Oct 2026 09:12:00.002 * Ready to accept connections tcp'] },
       description: 'Redis. Listens on 6379, no HTTP.',
+    },
+    'registry.k8s.io/ingress-nginx/controller:v1.12.0': {
+      ports: [80, 443, 8443, 10254], memoryMiB: 90, cpuMillis: 15, startMs: 1500, sizeBytes: 104_000_000, proxy: 'ingress-nginx', user: 101,
+      http: { '/healthz': { status: 200, body: 'ok' }, '/metrics': { status: 200, body: '# HELP nginx_ingress_controller_requests The total number of client requests\n' } },
+      logs: { start: ['-------------------------------------------------------------------------------', 'NGINX Ingress controller', '  Release:       v1.12.0', '  Repository:    https://github.com/kubernetes/ingress-nginx', '-------------------------------------------------------------------------------', 'I1005 09:00:01.000000       7 nginx.go:311] "Starting NGINX process"', 'I1005 09:00:01.100000       7 leaderelection.go:254] attempting to acquire leader lease ingress-nginx/ingress-nginx-leader...', 'I1005 09:00:01.400000       7 controller.go:213] "Backend successfully reloaded"'] },
+      description: 'ingress-nginx controller (the proxy and the controller are one process).',
+    },
+    'docker.io/envoyproxy/gateway:v1.2.6': {
+      ports: [18000, 18001, 19001], memoryMiB: 60, cpuMillis: 10, startMs: 1200, sizeBytes: 71_000_000, controller: 'envoy-gateway', hasShell: false, user: 65532,
+      logs: { start: ['2026-10-05T09:00:01.000Z\tINFO\tcmd/server.go:85\tinitialized global logger', '2026-10-05T09:00:01.200Z\tINFO\tprovider\tkubernetes/kubernetes.go:122\twatching all namespaces', '2026-10-05T09:00:01.900Z\tINFO\txds-server\trunner/runner.go:112\tstarted'] },
+      description: 'Envoy Gateway control plane.',
+    },
+    'docker.io/envoyproxy/envoy:distroless-v1.32.3': {
+      ports: [19001], memoryMiB: 45, cpuMillis: 10, startMs: 900, sizeBytes: 58_000_000, proxy: 'envoy-gateway', hasShell: false, user: 65532,
+      logs: { start: ['[2026-10-05 09:00:01.000][1][info][main] [source/server/server.cc:432] initializing epoch 0', '[2026-10-05 09:00:01.600][1][info][config] [source/server/listener_manager_impl.cc:944] all dependencies initialized. starting workers'] },
+      description: 'Envoy proxy managed by Envoy Gateway.',
     },
     'registry.orbital.local/freight/frontend:1.4.0': {
       ports: [8080], memoryMiB: 64, cpuMillis: 30, startMs: 1200, sizeBytes: 52_000_000,

@@ -4,6 +4,7 @@ import { str, bool, KubectlError } from '../args.ts';
 import { parseResourceArgs, fetch } from '../resources.ts';
 import { describe } from '../describe.ts';
 import type { KubeObject } from '../../types.ts';
+import { access } from '../api.ts';
 
 export const describeCommand: KubectlCommand = {
   name: 'describe',
@@ -24,14 +25,14 @@ export const describeCommand: KubectlCommand = {
     for (const ref of refs) {
       if (ref.name !== undefined) {
         // describe matches by name prefix when the exact name is missing (upstream behaviour)
-        try { objs.push(...fetch(ctx.engine, ref, ctx.namespace, allNs, str(a, 'selector'))); }
+        try { objs.push(...fetch(ctx.engine, ref, ctx.namespace, allNs, str(a, 'selector'), undefined, access(ctx))); }
         catch (e) {
           if (!(e instanceof KubectlError) || !e.message.includes('NotFound')) throw e;
           const prefix = fetch(ctx.engine, { info: ref.info }, ctx.namespace, allNs, str(a, 'selector')).filter((o) => o.metadata.name.startsWith(ref.name as string));
           if (!prefix.length) throw e;
           objs.push(...prefix);
         }
-      } else objs.push(...fetch(ctx.engine, ref, ctx.namespace, allNs, str(a, 'selector')));
+      } else objs.push(...fetch(ctx.engine, ref, ctx.namespace, allNs, str(a, 'selector'), undefined, access(ctx)));
     }
     if (objs.length === 0) { yield err(`No resources found in ${ctx.namespace} namespace.\n`); return 0; }
     let first = true;

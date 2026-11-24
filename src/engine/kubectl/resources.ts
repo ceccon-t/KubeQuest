@@ -4,6 +4,7 @@ import type { KubeObject } from '../types.ts';
 import { resolveResource, allResources, type ResourceInfo } from '../registry.ts';
 import { KubectlError } from './args.ts';
 import { parseSelectorString, matches, SelectorParseError } from '../selector.ts';
+import { authorize, forbiddenMessage, type UserInfo } from '../rbac.ts';
 
 export interface ResourceRef {
   info: ResourceInfo;
@@ -53,10 +54,21 @@ export function notFound(info: ResourceInfo, name: string): KubectlError {
   return new KubectlError(`Error from server (NotFound): ${info.plural} "${name}" not found`);
 }
 
+/** Who is asking and for what; only checked when the request is impersonated (`--as`). */
+export interface Access { user: UserInfo; verb?: string; subresource?: string }
+
+/** RBAC check for one request; throws kubectl's Forbidden error. */
+export function authorizeAccess(engine: Engine, access: Access | undefined, info: ResourceInfo, verb: string, namespace: string | undefined, name?: string, subresource?: string): void {
+  if (!access || access.user.groups.includes('system:masters')) return;
+  const req = { verb, group: info.group, resource: info.plural, subresource, namespace: info.namespaced ? namespace : undefined, name };
+  if (!authorize(engine, access.user, req)) throw new KubectlError(`Error from server (Forbidden): ${forbiddenMessage(access.user, req)}`);
+}
+
 /** Fetch the objects for a ref, applying namespace, label selector and field selector. */
-export function fetch(engine: Engine, ref: ResourceRef, ns: string, allNs: boolean, selector?: string, fieldSelector?: string): KubeObject[] {
+export function fetch(engine: Engine, ref: ResourceRef, ns: string, allNs: boolean, selector?: string, fieldSelector?: string, access?: Access): KubeObject[] {
   const { info } = ref;
   const scopeNs = info.namespaced ? (allNs ? undefined : ns) : undefined;
+  authorizeAccess(engine, access, info, access?.verb ?? (ref.name !== undefined ? 'get' : 'list'), scopeNs, ref.name, access?.subresource);
   if (info.namespaced && !allNs && ref.name !== undefined && !engine.store.get('Namespace', undefined, ns)) {
     throw new KubectlError(`Error from server (NotFound): namespaces "${ns}" not found`);
   }

@@ -79,7 +79,8 @@ code review and by `npm run check`. Read `ARCHITECTURE.md` before touching code 
 
 ## 6. Performance & resources
 - Tick ≤ 1 ms at 100 pods; render ≤ 4 ms/frame. No work while paused.
-- Bundle ≤ 600 KB. Check with `npm run build` (sizes printed).
+- Bundle ≤ 1400 KB (unminified `dist/web/app.js`; ~920 KB minified). Check with `npm run build` (sizes printed).
+  The budget was 600 KB for the 14-mission MVP; `docs/TECH_SPEC.md §9` records why it was raised.
 
 ## 7. Definition of done for a PR
 Scope line referenced · tests added · `npm run check` green · `ARCHITECTURE.md`

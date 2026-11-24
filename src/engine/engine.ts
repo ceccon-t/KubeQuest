@@ -16,6 +16,15 @@ import { runDaemonSetController } from './controllers/daemonset.ts';
 import { runGarbageCollector } from './controllers/gc.ts';
 import { TrafficSim, type TrafficSource } from './traffic.ts';
 import { applyDefaults } from './defaults.ts';
+import { runStatefulSetController } from './controllers/statefulset.ts';
+import { runStorageController } from './controllers/storage.ts';
+import { runHpaController } from './controllers/hpa.ts';
+import { runPolicyControllers, runNamespaceController } from './controllers/policy.ts';
+import { runIngressControllers } from './controllers/ingress.ts';
+import { runCrdController, syncCustomResources, type OperatorSpec } from './controllers/crd.ts';
+import { runGitOpsController } from './controllers/gitops.ts';
+import { bootstrapRbac } from './rbac.ts';
+import { useDynamicResources, type ResourceInfo } from './registry.ts';
 
 export interface NodeSetup {
   name: string;
@@ -28,6 +37,8 @@ export interface NodeSetup {
   ready?: boolean;
   unschedulable?: boolean;
   version?: string;
+  /** Extended resources a device plugin advertises on this node, e.g. `{ 'nvidia.com/gpu': '2' }`. */
+  extendedResources?: Record<string, string>;
 }
 
 export interface ClusterSetup {
@@ -48,6 +59,18 @@ export interface ClusterSetup {
   clusterName?: string;
   /** Cluster-level time scale (1 = real time). */
   timeScale?: number;
+  /** Whether the CNI enforces NetworkPolicy (Cilium/Calico do; plain flannel silently ignores policies). Default true. */
+  networkPolicyEnforced?: boolean;
+  /** Per-pod custom metrics served by a metrics adapter (e.g. `http_requests_per_second`), for HPA `Pods` metrics. */
+  customMetrics?: string[];
+  /** Certificate issuers the workstation trusts (the corporate CA). */
+  trustedIssuers?: string[];
+  /** Reconcile loops of operators deployed in this cluster; each runs only while its controller pod is Ready. */
+  operators?: OperatorSpec[];
+  /** Git repositories the GitOps controller can read: remote URL → workstation directory that is its clone. */
+  gitRemotes?: Record<string, string>;
+  /** Seconds between GitOps repository polls (Argo CD default: 180). */
+  gitPollSeconds?: number;
 }
 
 export const DEFAULT_EPOCH_MS = Date.UTC(2026, 9, 5, 9, 0, 0);
@@ -66,6 +89,16 @@ export class Engine {
   readonly version: string;
   readonly clusterName: string;
   readonly timeScale: number;
+  readonly networkPolicyEnforced: boolean;
+  readonly customMetrics: string[];
+  readonly trustedIssuers: string[];
+  readonly operators: OperatorSpec[];
+  readonly gitRemotes: Record<string, string>;
+  readonly gitPollSeconds: number;
+  /** Resource types served through CRDs (kept in sync with the CustomResourceDefinition objects). */
+  readonly crdResources: ResourceInfo[] = [];
+  /** Volume contents by volume id (PersistentVolume name, or `emptydir:<pod uid>:<volume>`): path inside the volume → text. */
+  readonly volumes = new Map<string, Map<string, string>>();
   /** Tick counter (100ms quanta). */
   ticks = 0;
   /** Current kubeconfig context state. */
@@ -87,9 +120,23 @@ export class Engine {
     this.version = setup.kubernetesVersion ?? 'v1.32.3';
     this.clusterName = setup.clusterName ?? 'orbital-prod';
     this.timeScale = setup.timeScale ?? 1;
+    this.networkPolicyEnforced = setup.networkPolicyEnforced ?? true;
+    this.customMetrics = setup.customMetrics ?? [];
+    this.trustedIssuers = setup.trustedIssuers ?? ['CN=Orbital Internal CA'];
+    this.operators = setup.operators ?? [];
+    this.gitRemotes = setup.gitRemotes ?? {};
+    this.gitPollSeconds = setup.gitPollSeconds ?? 180;
     this.traffic = new TrafficSim(this);
+    this.activate();
+    this.store.subscribe((_type, obj) => { if (obj.kind === 'CustomResourceDefinition') syncCustomResources(this); });
+    // objects the API server and controller-manager create on first start
+    for (const o of bootstrapRbac()) this.store.create(o);
+    for (const [name, value, description] of [['system-cluster-critical', 2000000000, 'Used for system critical pods that must run in the cluster, but can be moved to another node if necessary.'], ['system-node-critical', 2000001000, 'Used for system critical pods that must not be moved from their current node.']] as const) {
+      this.store.create({ apiVersion: 'scheduling.k8s.io/v1', kind: 'PriorityClass', metadata: { name }, value, description, preemptionPolicy: 'PreemptLowerPriority' });
+    }
 
     for (const ns of ['default', 'kube-system', 'kube-public', 'kube-node-lease', ...(setup.namespaces ?? [])]) this.ensureNamespace(ns);
+    runNamespaceController(this);
     for (const n of setup.nodes) this.addNode(n);
 
     // Pre-existing objects, oldest first, reconciled by fast-forwarding the clock.
@@ -151,8 +198,8 @@ export class Engine {
       metadata: { name: n.name, labels, annotations: { 'node.alpha.kubernetes.io/ttl': '0', 'volumes.kubernetes.io/controller-managed-attach-detach': 'true' } },
       spec: { podCIDR: `10.244.${idx}.0/24`, podCIDRs: [`10.244.${idx}.0/24`], ...(taints.length ? { taints } : {}), ...(n.unschedulable ? { unschedulable: true } : {}) },
       status: {
-        capacity: { cpu, 'ephemeral-storage': '61202244Ki', memory, pods: String(n.pods ?? 110) },
-        allocatable: { cpu, 'ephemeral-storage': '56403987978', memory, pods: String(n.pods ?? 110) },
+        capacity: { cpu, 'ephemeral-storage': '61202244Ki', memory, pods: String(n.pods ?? 110), ...(n.extendedResources ?? {}) },
+        allocatable: { cpu, 'ephemeral-storage': '56403987978', memory, pods: String(n.pods ?? 110), ...(n.extendedResources ?? {}) },
         conditions: [],
         addresses: [
           { type: 'InternalIP', address: `172.18.0.${idx + 2}` },
@@ -216,8 +263,14 @@ export class Engine {
     return this.nodePortCounter;
   }
 
+  /** Make this engine's custom resource types the ones the registry resolves (several engines can be alive). */
+  activate(): void {
+    useDynamicResources(this.crdResources);
+  }
+
   /** Advance the simulation by dtMs (game time). */
   tick(dtMs: number): void {
+    this.activate();
     this.clock.advance(dtMs);
     this.ticks++;
     runNodeLifecycle(this);
@@ -226,10 +279,17 @@ export class Engine {
     runReplicaSetController(this);
     runDeploymentController(this);
     runDaemonSetController(this);
+    runStatefulSetController(this);
     runJobController(this);
     runCronJobController(this);
+    runStorageController(this);
+    runHpaController(this);
+    runPolicyControllers(this);
     runServiceController(this);
     runEndpointsController(this);
+    runIngressControllers(this);
+    runCrdController(this);
+    runGitOpsController(this);
     runGarbageCollector(this);
     this.traffic.tick(dtMs);
   }

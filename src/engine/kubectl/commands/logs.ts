@@ -7,9 +7,15 @@ import { fromLabelSelector, matches } from '../../selector.ts';
 import { parseGoDuration } from '../../duration.ts';
 import { execInContainer, interactiveShell } from '../../container-shell.ts';
 import { resolveTargetPort, serviceBackends } from '../../controllers/service.ts';
+import { access } from '../api.ts';
+import { authorizeAccess } from '../resources.ts';
+import { resourceByKind } from '../../registry.ts';
 
 /** Resolve `POD`, `pod/NAME`, `deploy/NAME`, `svc/NAME` etc. to pods (first match for workloads, like kubectl). */
-function podsFor(ctx: CommandContext, arg: string, selector?: string): { pods: Pod[]; note?: string } {
+function podsFor(ctx: CommandContext, arg: string, selector?: string, sub = 'log', verb = 'get'): { pods: Pod[]; note?: string } {
+  // logs/exec are subresources of pods: `get pods/log`, `create pods/exec`
+  const podInfo = resourceByKind('Pod');
+  if (podInfo) authorizeAccess(ctx.engine, access(ctx), podInfo, verb, ctx.namespace, undefined, sub);
   if (selector) {
     const ref = parseResourceArgs(['pods'])[0]!;
     return { pods: fetch(ctx.engine, ref, ctx.namespace, ctx.allNamespaces, selector) as Pod[] };
@@ -36,7 +42,8 @@ function podsFor(ctx: CommandContext, arg: string, selector?: string): { pods: P
 function pickContainer(pod: Pod, name: string | undefined): string {
   const names = pod.spec.containers.map((c) => c.name);
   if (name) {
-    if (!names.includes(name)) throw new KubectlError(`container ${name} is not valid for pod ${pod.metadata.name}`);
+    const all = [...names, ...(pod.spec.initContainers ?? []).map((c) => c.name), ...(pod.spec.ephemeralContainers ?? []).map((c) => c.name)];
+    if (!all.includes(name)) throw new KubectlError(`container ${name} is not valid for pod ${pod.metadata.name}`);
     return name;
   }
   if (names.length > 1) {
@@ -94,10 +101,10 @@ export const logsCommand: KubectlCommand = {
     };
     for (const s of streams) {
       const rt = ctx.engine.podRuntime(s.pod).containers.find((c) => c.name === s.container);
-      const cs = s.pod.status.containerStatuses?.find((c) => c.name === s.container);
+      const cs = [...(s.pod.status.containerStatuses ?? []), ...(s.pod.status.initContainerStatuses ?? []), ...(s.pod.status.ephemeralContainerStatuses ?? [])].find((c) => c.name === s.container);
       if (bool(a, 'previous')) {
         if (!rt || !rt.lastExit || !rt.prevLogs.length && !rt.lastExit) throw new KubectlError(`Error from server (BadRequest): previous terminated container "${s.container}" in pod "${s.pod.metadata.name}" not found`);
-      } else if (!rt || !cs || cs.state.waiting) {
+      } else if (!rt || !cs || (cs.state.waiting && !rt.prevLogs.length && !rt.logs.length) || (cs.state.waiting && cs.state.waiting.reason !== 'CrashLoopBackOff')) {
         const reason = cs?.state.waiting?.reason ?? 'ContainerCreating';
         const why = reason === 'ImagePullBackOff' || reason === 'ErrImagePull' ? `trying and failing to pull image` : reason === 'CrashLoopBackOff' ? `CrashLoopBackOff` : reason;
         if (reason === 'CrashLoopBackOff' && rt) { /* crashlooping: current logs may exist from the latest attempt; upstream returns logs of the last run */ }
@@ -146,10 +153,10 @@ export const execCommand: KubectlCommand = {
     if (!a.positional.length) throw new KubectlError('pod, type/name or --filename must be specified');
     if (a.positional.length > 1 && a.rest.length === 0) throw new KubectlError('exec [POD] [COMMAND] is not supported anymore. Use exec [POD] -- [COMMAND] instead.');
     if (a.rest.length === 0) throw new KubectlError('you must specify at least one command for the container');
-    const { pods } = podsFor(ctx, a.positional[0] as string);
+    const { pods } = podsFor(ctx, a.positional[0] as string, undefined, 'exec', 'create');
     const pod = pods[0] as Pod;
     const container = pickContainer(pod, str(a, 'container'));
-    const cs = pod.status.containerStatuses?.find((c) => c.name === container);
+    const cs = [...(pod.status.containerStatuses ?? []), ...(pod.status.initContainerStatuses ?? []), ...(pod.status.ephemeralContainerStatuses ?? [])].find((c) => c.name === container);
     if (!cs || !cs.state.running) {
       if (cs?.state.waiting?.reason === 'ContainerCreating' || !cs) throw new KubectlError(`Error from server (BadRequest): pod ${pod.metadata.name} does not have a host assigned`.replace('does not have a host assigned', pod.spec.nodeName ? `container "${container}" is waiting to start: ${cs?.state.waiting?.reason ?? 'ContainerCreating'}` : 'does not have a host assigned'));
       throw new KubectlError(`unable to upgrade connection: container not found ("${container}")`);

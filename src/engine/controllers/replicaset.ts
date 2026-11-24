@@ -1,9 +1,11 @@
 /** ReplicaSet controller: keep spec.replicas pods matching the selector. upstream: pkg/controller/replicaset */
 import type { Engine } from '../engine.ts';
+import { syncDue, syncFailed, syncSucceeded } from './requeue.ts';
 import type { Pod, ReplicaSet, Condition } from '../types.ts';
 import { fromLabelSelector, matches } from '../selector.ts';
 import { applyDefaults } from '../defaults.ts';
 import { isPodReady, isPodAvailable } from './kubelet.ts';
+import { admitPod } from '../admission.ts';
 
 const BURST = 500;
 
@@ -81,16 +83,22 @@ export function runReplicaSetController(engine: Engine): void {
     const pods = activePods(engine, rs);
     const desired = rs.spec.replicas ?? 1;
     const diff = pods.length - desired;
-    if (diff < 0) {
+    const retryKey = `rs:${rs.metadata.uid}`;
+    if (diff < 0 && syncDue(engine, retryKey, rs)) {
       const n = Math.min(-diff, BURST);
       for (let i = 0; i < n; i++) {
         const pod = newPodFromTemplate(engine, rs);
         try {
+          admitPod(engine, pod);
           engine.store.create(pod);
           engine.store.event({ type: 'Normal', reason: 'SuccessfulCreate', message: `Created pod: ${pod.metadata.name}`, involved: rs, component: 'replicaset-controller' });
           pods.push(pod);
+          syncSucceeded(engine, retryKey);
         } catch (e) {
           engine.store.event({ type: 'Warning', reason: 'FailedCreate', message: `Error creating: ${(e as Error).message}`, involved: rs, component: 'replicaset-controller' });
+          // upstream: a failed sync is requeued with exponential backoff, and the remaining creates of the batch are skipped
+          syncFailed(engine, retryKey, rs);
+          break;
         }
       }
     } else if (diff > 0) {

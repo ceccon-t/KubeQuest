@@ -115,6 +115,8 @@ export class ClusterView {
     const d = this.deployment(ns, name);
     if (!d) return false;
     const want = replicas ?? d.spec.replicas ?? 1;
+    // a status that predates the latest spec change says nothing about it (kubectl rollout status checks the same)
+    if ((d.status.observedGeneration ?? 0) < (d.metadata.generation ?? 0)) return false;
     return (d.spec.replicas ?? 1) === want && (d.status.availableReplicas ?? 0) === want && (d.status.updatedReplicas ?? 0) === want && (d.status.replicas ?? 0) === want;
   }
   deploymentImage(ns: string, name: string, container?: string): string | undefined {

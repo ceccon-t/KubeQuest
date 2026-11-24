@@ -41,24 +41,33 @@ in that browser's `localStorage` instead.
   terminal until you resume; **↺ Restart** rebuilds the ticket from its initial state.
 - Settings (⚙): reduced motion, font size, unlock all tickets, export/import progress.
 
-### What is in the campaign (v0.1)
+### What is in the campaign
+42 tickets in nine chapters, following `curriculum-full.md` stage by stage.
+
 | Chapter | Tickets | Curriculum |
 |---|---|---|
 | 0 Orientation | Welcome aboard | — |
-| 1 Foundations | The image that wasn't | Stage 1 (images, registries, pulls) |
+| 1 Foundations | The image that wasn't · The tag that moved | Stage 1 (images, tags and digests, registries, pulls) |
 | 2 Hands-On | Where is everything? · Logs don't lie · Declarative by Friday · Inside the box | Stage 2 (kubectl fluency, debugging, declarative vs imperative) |
-| 3 Workloads | Three of a kind · Ship it (and un-ship it) · Probe-ably fine · Out of memory · Night shift · **Capstone: Zero-downtime Friday** | Stage 3 (ReplicaSets, Deployments, probes, resources, Jobs/CronJobs/DaemonSets, drains) |
-| 4 Networking | Nobody's home · Open to the world | Stage 4 (Services, endpoints, DNS, NodePort/LoadBalancer) |
+| 3 Workloads | Three of a kind · Ship it (and un-ship it) · Probe-ably fine · Out of memory · Night shift · **Capstone: Zero-downtime Friday** · Two in a pod · No shell, no problem | Stage 3 (ReplicaSets, Deployments, probes, resources, Jobs/CronJobs/DaemonSets, drains, sidecars and init containers, `kubectl debug`) |
+| 4 Networking | Nobody's home · Open to the world · One door, many rooms · Gateway to the future · Default deny · **Capstone: The front door** | Stage 4 (Services, endpoints, DNS, NodePort/LoadBalancer, Ingress, Gateway API, NetworkPolicy) |
+| 5 Config, State & Security | Config is not code · Data that outlives the Pod · Pets with names · Least privilege · Run as nobody · Policy as code · **Capstone: The vault** | Stage 5 (ConfigMaps, Secrets, PV/PVC/StorageClass, StatefulSets, RBAC, securityContext, Pod Security Admission, ValidatingAdmissionPolicy, private registries) |
+| 6 Running in Production | A place for everything · Elastic · Budget for disruption · Fair shares · Upgrade window · **Capstone: Peak day** | Stage 6 (taints, affinity, topology spread, HPA, PodDisruptionBudgets, quotas and LimitRanges, version skew and removed APIs, node upgrades) |
+| 7 Delivery & Extension | One base, many environments · Charts and releases · Git is the source of truth · Teach the cluster a new word · **Capstone: Hands off prod** | Stage 7 (Kustomize, Helm, GitOps with Argo CD, CRDs and operators) |
+| 8 Specialization Tracks | The GPU queue · A new tenant · Game day | Stage 8 (GPU scheduling, multi-tenancy, chaos engineering) |
 | Sandbox | free play | — |
 
-Stages 5–8 (configuration, storage, security, production operations, platform engineering) are
-planned; the architecture already supports the resource kinds and controllers they need.
+Topics the curriculum lists that a kubectl terminal cannot exercise (service meshes, eBPF tooling,
+observability stacks, WebAssembly runtimes, managed-cloud specifics) are covered as concept cards
+and debrief notes rather than as simulated systems.
 
 ## Faithfulness
 
 The simulator targets **kubectl / Kubernetes v1.32** output and semantics: table layouts, error
 strings, Deployment rollout maths (maxSurge/maxUnavailable), CrashLoopBackOff timings, probe
-semantics, scheduler messages, endpoints ↔ readiness, node eviction. Anything not implemented
+semantics, scheduler messages, endpoints ↔ readiness, node eviction, admission and RBAC errors.
+The delivery tools on the workstation follow their upstream output too: Kustomize v5.5 (including
+the name-suffix hash), Helm v3, git, and the Argo CD `Application` status. Anything not implemented
 fails honestly (`kubequest: … is not supported in the simulator yet`) rather than pretending.
 Every mission ships with a scripted solution that runs as a test.
 

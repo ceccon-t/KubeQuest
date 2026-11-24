@@ -84,6 +84,8 @@ export const GLOBAL_FLAGS: FlagSpec[] = [
   { name: 'v', type: 'int' },
   { name: 'request-timeout', type: 'string' },
   { name: 'warnings-as-errors', type: 'bool' },
+  { name: 'as', type: 'string' },
+  { name: 'as-group', type: 'strings' },
 ];
 
 export function parseFlags(tokens: string[], specs: FlagSpec[], opts: { allowRest?: boolean; stopAtFirstPositional?: boolean } = {}): ParsedArgs {

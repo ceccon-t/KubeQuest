@@ -314,5 +314,141 @@ export const m3_6: Mission = {
   debrief: { proTips: ['PodDisruptionBudgets make `drain` wait so you never evict below a minimum — Chapter 6.', 'Spread replicas across nodes/zones with topologySpreadConstraints so one node loss cannot take all of them.', 'Shorter `tolerationSeconds` on critical Deployments means faster replacement after node loss, at the risk of flapping.'] },
 };
 
-export const chapter3: Mission[] = [m3_1, m3_2, m3_3, m3_4, m3_5, m3_6];
+const ARCHIVER_YAML = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: archiver
+  namespace: freight
+  labels:
+    app: archiver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: archiver
+  template:
+    metadata:
+      labels:
+        app: archiver
+    spec:
+      containers:
+      - name: archiver
+        image: ${REG}/archiver:3.2
+        ports:
+        - containerPort: 8080
+`;
+
+const sharedLogs = (c: { view: { deployment: (ns: string, n: string) => { spec: { template: { spec: { containers: { name: string; volumeMounts?: { name: string; mountPath: string }[] }[]; initContainers?: { name: string; volumeMounts?: { name: string; mountPath: string }[] }[]; volumes?: { name: string; emptyDir?: unknown }[] } } } } | undefined } }): string | undefined => {
+  const spec = c.view.deployment('freight', 'archiver')?.spec.template.spec;
+  if (!spec) return undefined;
+  const app = spec.containers.find((x) => x.name === 'archiver');
+  const mount = app?.volumeMounts?.find((m) => m.mountPath.replace(/\/$/, '') === '/var/log/archiver');
+  if (!mount || !spec.volumes?.some((v) => v.name === mount.name && v.emptyDir !== undefined)) return undefined;
+  const other = [...spec.containers, ...(spec.initContainers ?? [])].find((x) => x.name !== 'archiver' && x.volumeMounts?.some((m) => m.name === mount.name));
+  return other?.name;
+};
+
+export const m3_7: Mission = {
+  id: '3.7', chapter: 3, order: 7, title: 'Two in a pod', tagline: 'A legacy app, a shared volume and a sidecar.',
+  ticket: {
+    from: 'Compliance (Ines)', priority: 'P3', subject: 'Audit trail of manifest-archiver is not in the log pipeline',
+    body: [
+      'The log pipeline collects container stdout. The legacy manifest-archiver writes its audit trail to a file, `/var/log/archiver/audit.log`, so `kubectl logs` shows one line and the auditors see nothing.',
+      'We cannot change the image this quarter. Make the audit trail appear on stdout of the Pod without touching the application: add a second container that follows the file.',
+      'The manifest is ~/manifests/archiver.yaml. `busybox:1.36` is available; `tail -n+1 -F FILE` follows a file from its first line.',
+    ],
+  },
+  concepts: [
+    { title: 'One Pod, several containers', body: 'Containers in a Pod share the network namespace (same IP, `localhost`) and can share **volumes**. Use more than one container only when the helpers live and die with the main app: log shippers, proxies, config reloaders. Otherwise, separate Pods scale and fail independently.', example: 'kubectl logs POD -c CONTAINER\nkubectl get pod POD   # READY 2/2' },
+    { title: 'emptyDir: scratch space for the Pod', body: 'An `emptyDir` volume is created empty when the Pod starts and deleted with it. Every container that mounts it sees the same files — the classic way to hand data from one container to another. It survives container restarts, not Pod deletion.', example: 'volumes:\n- name: logs\n  emptyDir: {}' },
+    { title: 'Init containers and native sidecars', body: '`initContainers` run one by one to completion before the app starts (migrations, waiting for a dependency). An init container with `restartPolicy: Always` is a **native sidecar**: it starts first, keeps running, and stops after the app — so it never blocks a Job from finishing.', example: 'initContainers:\n- name: audit-tail\n  restartPolicy: Always' },
+  ],
+  cluster: {
+    seed: 47, nodes: orbitalNodes(), namespaces: ['freight'], images: ORBITAL_IMAGES,
+    objects: [
+      ...systemWorkloads(),
+      { ageSeconds: 5 * 86400, object: deployment({ name: 'archiver', ns: 'freight', image: `${REG}/archiver:3.2`, replicas: 1, port: 8080 }) },
+      { ageSeconds: 3 * 86400, object: deployment({ name: 'frontend', ns: 'freight', image: `${REG}/frontend:1.4.0`, replicas: 2, port: 8080 }) },
+      { ageSeconds: 3 * 86400, object: service({ name: 'frontend', ns: 'freight', selector: { app: 'frontend' }, port: 80, targetPort: 8080 }) },
+    ],
+    traffic: [{ id: 'customers', service: 'freight/frontend', rps: 3, label: 'customers' }],
+  },
+  files: { 'manifests/archiver.yaml': ARCHIVER_YAML },
+  objectives: [
+    { id: 'empty', text: 'Check what kubectl logs shows for the archiver', check: (c) => c.history.some((h) => /^(kubectl|k) logs\b.*archiver/.test(h.line) && /logging to \/var\/log\/archiver\/audit\.log/.test(h.stdout)) },
+    { id: 'file', text: 'Read the audit file inside the container (kubectl exec)', check: (c) => c.history.some((h) => /^(kubectl|k) exec\b/.test(h.line) && /AUDIT /.test(h.stdout)) },
+    { id: 'sidecar', text: 'The archiver Pod has a second container sharing an emptyDir at /var/log/archiver', check: (c) => sharedLogs(c) !== undefined },
+    { id: 'stdout', text: 'The audit trail is on stdout of the sidecar (kubectl logs -c)', check: (c) => { const name = sharedLogs(c); return !!name && c.view.deploymentReady('freight', 'archiver', 1) && c.history.some((h) => /^(kubectl|k) logs\b/.test(h.line) && h.line.includes(name) && /AUDIT /.test(h.stdout)); } },
+    { id: 'native', text: 'Bonus: declare the helper as a native sidecar (initContainers + restartPolicy: Always)', optional: true, check: (c) => !!c.view.deployment('freight', 'archiver')?.spec.template.spec.initContainers?.some((x) => (x as { restartPolicy?: string }).restartPolicy === 'Always') && c.view.deploymentReady('freight', 'archiver', 1) },
+  ],
+  hints: [
+    { text: '`kubectl logs deploy/archiver -n freight` prints a single line. `kubectl exec deploy/archiver -n freight -- cat /var/log/archiver/audit.log` shows where the real log goes.', cost: 80 },
+    { text: 'In manifests/archiver.yaml add a volume (`volumes: [{name: logs, emptyDir: {}}]` under the Pod spec) and mount it in the archiver container at `/var/log/archiver` (`volumeMounts`). The file now lives in the shared volume.', cost: 120 },
+    { text: 'Add a second entry under `containers:` — `name: audit-tail`, `image: busybox:1.36`, `command: ["sh", "-c", "tail -n+1 -F /var/log/archiver/audit.log"]`, same `volumeMounts`. Apply, then `kubectl logs deploy/archiver -c audit-tail -n freight`.', cost: 150 },
+  ],
+  par: { timeSec: 420, commands: 8 },
+  solution: [
+    'kubectl logs deploy/archiver -n freight',
+    'kubectl exec deploy/archiver -n freight -- cat /var/log/archiver/audit.log',
+    { edit: 'manifests/archiver.yaml', replace: ['        ports:\n        - containerPort: 8080\n', '        ports:\n        - containerPort: 8080\n        volumeMounts:\n        - name: logs\n          mountPath: /var/log/archiver\n      - name: audit-tail\n        image: busybox:1.36\n        command: ["sh", "-c", "tail -n+1 -F /var/log/archiver/audit.log"]\n        volumeMounts:\n        - name: logs\n          mountPath: /var/log/archiver\n      volumes:\n      - name: logs\n        emptyDir: {}\n'] },
+    'kubectl apply -f manifests/archiver.yaml',
+    'kubectl rollout status deployment/archiver -n freight',
+    'sleep 8',
+    'kubectl get pods -n freight -l app=archiver',
+    'kubectl logs deploy/archiver -c audit-tail -n freight',
+  ],
+  debrief: { proTips: ['`kubectl logs POD --all-containers --prefix` prints every container with its name in front.', 'Cluster-wide log shippers (Fluent Bit, Vector) run as a DaemonSet and read stdout of every Pod — the sidecar only has to get the lines to stdout.', 'A sidecar shares the Pod\'s fate and resources: give it its own small requests and limits.'] },
+};
+
+export const m3_8: Mission = {
+  id: '3.8', chapter: 3, order: 8, title: 'No shell, no problem', tagline: 'Debug a distroless container with an ephemeral one.',
+  ticket: {
+    from: 'PagerDuty → route-planner', priority: 'P2', subject: 'Route planning returns 502 since the morning cleanup; logs say nothing useful',
+    body: [
+      'The route planner answers 502 on /plan. Its logs only say requests are handled. The image is distroless: no shell, no curl — `kubectl exec … sh` does not work.',
+      'The process has an admin endpoint inside the Pod, `localhost:9090/debug/config`, that prints the configuration it actually runs with. It is not exposed through the Service.',
+      'Get inside the Pod with an ephemeral debug container, find the wrong setting, and fix the Deployment.',
+    ],
+  },
+  concepts: [
+    { title: 'Distroless images', body: 'A distroless image contains the application and its runtime libraries — no shell, no package manager, no `ls`. Smaller, fewer CVEs, less to exploit. The price: `kubectl exec` has nothing to run.', example: 'kubectl exec POD -- sh\n# exec: "sh": executable file not found in $PATH' },
+    { title: 'Ephemeral containers', body: '`kubectl debug POD -it --image=busybox:1.36 --target=CONTAINER` adds a temporary container to a **running** Pod. It shares the Pod network (so `localhost` is the app) and, with `--target`, the process namespace of that container: `ps` shows its processes and `/proc/1/root/` is its filesystem.', example: 'kubectl debug POD -it --image=busybox:1.36 --target=route-planner' },
+    { title: 'What they are not', body: 'Ephemeral containers cannot be removed or restarted, have no ports, probes or resource guarantees, and vanish with the Pod. They are for looking, not for fixing: the fix still goes into the Deployment.', example: 'kubectl describe pod POD   # Ephemeral Containers:' },
+  ],
+  cluster: {
+    seed: 48, nodes: orbitalNodes(), namespaces: ['freight'], images: ORBITAL_IMAGES,
+    objects: [
+      ...systemWorkloads(),
+      { ageSeconds: 3 * 86400, object: deployment({ name: 'cargo-api', ns: 'freight', image: `${REG}/cargo-api:2.1.0`, replicas: 2, port: 8080, env: [{ name: 'CARGO_DB_URL', value: 'postgres://cargo-db:5432/cargo' }] }) },
+      { ageSeconds: 3 * 86400, object: service({ name: 'cargo-api', ns: 'freight', selector: { app: 'cargo-api' }, port: 80, targetPort: 8080 }) },
+      { ageSeconds: 4 * 3600, object: deployment({ name: 'route-planner', ns: 'freight', image: `${REG}/route-planner:5.1.0`, replicas: 2, port: 8080, env: [{ name: 'CARGO_API_HOST', value: 'cargo-api-v1' }] }) },
+      { ageSeconds: 3 * 86400, object: service({ name: 'route-planner', ns: 'freight', selector: { app: 'route-planner' }, port: 80, targetPort: 8080 }) },
+    ],
+    traffic: [{ id: 'planner', service: 'freight/route-planner', path: '/plan', rps: 6, label: 'route planner' }],
+  },
+  objectives: [
+    { id: 'noshell', text: 'Try kubectl exec … sh on a route-planner pod and read the error', check: (c) => c.history.some((h) => /^(kubectl|k) exec\b/.test(h.line) && /executable file not found/.test(h.stderr)) },
+    { id: 'debug', text: 'Attach an ephemeral debug container that targets the route-planner container', check: (c) => c.view.pods('freight', 'app=route-planner').some((p) => (p.spec.ephemeralContainers ?? []).some((e) => e.targetContainerName === 'route-planner')) },
+    { id: 'find', text: 'From the debug container, find the setting that points at a service that does not exist', check: (c) => c.history.some((h) => /^(kubectl|k) (debug|exec)\b/.test(h.line) && /cargo-api-v1/.test(h.stdout)) },
+    { id: 'fix', text: 'Fix the Deployment: /plan answers again on 2/2 pods', check: (c) => /^cargo-api(\.freight(\.svc(\.cluster\.local)?)?)?$/.test(c.view.deployment('freight', 'route-planner')?.spec.template.spec.containers[0]?.env?.find((e) => e.name === 'CARGO_API_HOST')?.value ?? '') && c.view.deploymentReady('freight', 'route-planner', 2) },
+  ],
+  hints: [
+    { text: '`kubectl exec deploy/route-planner -n freight -- sh` fails: no shell in the image. `kubectl debug POD -n freight -it --image=busybox:1.36 --target=route-planner` gives you one next to it.', cost: 100 },
+    { text: 'Inside the debug shell: `wget -qO- localhost:9090/debug/config` (same network namespace) or `cat /proc/1/environ` (same process namespace). Compare the upstream with `kubectl get svc -n freight`.', cost: 120 },
+    { text: 'The planner calls `cargo-api-v1`; the Service is `cargo-api`. `kubectl set env deployment/route-planner CARGO_API_HOST=cargo-api -n freight`, then `kubectl rollout status deployment/route-planner -n freight`.', cost: 150 },
+  ],
+  par: { timeSec: 360, commands: 7 }, timeLimitSec: 720,
+  solution: [
+    'kubectl get pods,svc -n freight',
+    'kubectl exec deploy/route-planner -n freight -- sh',
+    'kubectl debug $(kubectl get pods -n freight -l app=route-planner -o name | head -1 | cut -d/ -f2) -n freight --image=busybox:1.36 --target=route-planner -c dbg -- sleep 3600',
+    'sleep 5',
+    'kubectl exec $(kubectl get pods -n freight -l app=route-planner -o name | head -1 | cut -d/ -f2) -n freight -c dbg -- wget -qO- localhost:9090/debug/config',
+    'kubectl set env deployment/route-planner CARGO_API_HOST=cargo-api -n freight',
+    'kubectl rollout status deployment/route-planner -n freight',
+  ],
+  debrief: { proTips: ['`kubectl debug --copy-to=NAME --share-processes` clones the Pod with a debug container when you may not touch the original.', '`kubectl debug node/NAME -it --image=busybox` gives a shell on a node, with its filesystem under /host.', 'Give debug containers a profile (`--profile=general`, `restricted`, `netadmin`) so they match the namespace\'s Pod Security level.'] },
+};
+
+export const chapter3: Mission[] = [m3_1, m3_2, m3_3, m3_4, m3_5, m3_6, m3_7, m3_8];
 void ((0 as unknown) as Pod);

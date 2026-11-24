@@ -15,7 +15,7 @@ export function runServiceController(engine: Engine): void {
   for (const svc of engine.store.list<Service>('Service')) {
     let changed = false;
     const type = svc.spec.type ?? 'ClusterIP';
-    if (type !== 'ExternalName' && !svc.spec.clusterIP) {
+    if (type !== 'ExternalName' && !svc.spec.clusterIP) { // `clusterIP: None` (headless) is kept as is
       svc.spec.clusterIP = engine.allocateClusterIp();
       svc.spec.clusterIPs = [svc.spec.clusterIP];
       changed = true;
@@ -122,16 +122,39 @@ function syncSlice(engine: Engine, svc: Service, ready: Pod[], notReady: Pod[], 
   }
 }
 
-/** Cluster DNS lookup: `name`, `name.ns`, `name.ns.svc`, `name.ns.svc.cluster.local`. */
-export function resolveDns(engine: Engine, host: string, fromNamespace: string): { ip: string; svc: Service } | undefined {
+/**
+ * Cluster DNS lookup: `name`, `name.ns`, `name.ns.svc`, `name.ns.svc.cluster.local`, and for headless Services
+ * the per-pod records `pod.name[.ns[.svc.cluster.local]]` (pods with hostname + subdomain, i.e. StatefulSet pods).
+ */
+export function resolveDns(engine: Engine, host: string, fromNamespace: string): { ip: string; svc?: Service; pod?: Pod; ips?: string[] } | undefined {
   const h = host.replace(/\.$/, '');
   const parts = h.split('.');
-  let name: string | undefined, ns: string | undefined;
-  if (parts.length === 1) { name = parts[0]; ns = fromNamespace; }
-  else if (parts.length === 2) { name = parts[0]; ns = parts[1]; }
-  else if (parts.length >= 3 && parts[2] === 'svc' && (parts.length === 3 || parts.slice(3).join('.') === 'cluster.local')) { name = parts[0]; ns = parts[1]; }
-  if (!name || !ns) return undefined;
-  const svc = engine.store.get<Service>('Service', ns, name);
-  if (!svc || !svc.spec.clusterIP || svc.spec.clusterIP === 'None') return undefined;
-  return { ip: svc.spec.clusterIP, svc };
+  const tail = (from: number): boolean => parts.length === from || (parts[from] === 'svc' && (parts.length === from + 1 || parts.slice(from + 1).join('.') === 'cluster.local'));
+  const lookup = (name: string | undefined, ns: string | undefined): Service | undefined => (name && ns ? engine.store.get<Service>('Service', ns, name) : undefined);
+  let svc: Service | undefined;
+  if (parts.length === 1) svc = lookup(parts[0], fromNamespace);
+  else if (parts.length === 2) svc = lookup(parts[0], parts[1]);
+  else if (tail(2)) svc = lookup(parts[0], parts[1]);
+  if (svc) {
+    if (svc.spec.clusterIP && svc.spec.clusterIP !== 'None') return { ip: svc.spec.clusterIP, svc };
+    if (svc.spec.clusterIP === 'None') {
+      // headless: A records of the ready pods
+      const ips = serviceBackends(engine, svc).ready.map((p) => p.status.podIP as string);
+      const first = serviceBackends(engine, svc).ready[0];
+      return first ? { ip: ips[0] as string, svc, pod: first, ips } : undefined;
+    }
+    return undefined;
+  }
+  // pod.subdomain[.ns...]
+  if (parts.length >= 2) {
+    const ns = parts.length === 2 ? fromNamespace : parts[2];
+    if (parts.length === 2 || tail(3)) {
+      const headless = lookup(parts[1], ns);
+      if (headless?.spec.clusterIP === 'None') {
+        const pod = serviceBackends(engine, headless).ready.find((p) => (p.spec.hostname ?? p.metadata.name) === parts[0] && p.spec.subdomain === headless.metadata.name);
+        if (pod?.status.podIP) return { ip: pod.status.podIP, pod, svc: headless };
+      }
+    }
+  }
+  return undefined;
 }

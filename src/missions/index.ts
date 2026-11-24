@@ -4,6 +4,11 @@ import { chapter1 } from './ch1.ts';
 import { chapter2 } from './ch2.ts';
 import { chapter3 } from './ch3.ts';
 import { chapter4 } from './ch4.ts';
+import { chapter4b } from './ch4b.ts';
+import { chapter5 } from './ch5.ts';
+import { chapter6 } from './ch6.ts';
+import { chapter7 } from './ch7.ts';
+import { chapter8 } from './ch8.ts';
 import { LESSONS } from './lessons.ts';
 import { INSIGHTS } from './insights.ts';
 
@@ -20,7 +25,11 @@ export const CHAPTERS: Chapter[] = [
   { number: 1, title: 'Foundations', subtitle: 'Containers & images', missions: withLessons(chapter1) },
   { number: 2, title: 'Hands-On', subtitle: 'kubectl fluency', missions: withLessons(chapter2) },
   { number: 3, title: 'Workloads', subtitle: 'Pods, ReplicaSets, Deployments', missions: withLessons(chapter3) },
-  { number: 4, title: 'Networking', subtitle: 'Services & discovery', missions: withLessons(chapter4) },
+  { number: 4, title: 'Networking', subtitle: 'Services, routing & segmentation', missions: withLessons([...chapter4, ...chapter4b]) },
+  { number: 5, title: 'Config, State & Security', subtitle: 'ConfigMaps, storage, RBAC, policy', missions: withLessons(chapter5) },
+  { number: 6, title: 'Running in Production', subtitle: 'Scheduling, autoscaling, disruptions, upgrades', missions: withLessons(chapter6) },
+  { number: 7, title: 'Delivery & Extension', subtitle: 'Kustomize, Helm, GitOps, operators', missions: withLessons(chapter7) },
+  { number: 8, title: 'Specialization Tracks', subtitle: 'GPUs, multi-tenancy, chaos engineering', missions: withLessons(chapter8) },
 ];
 
 export const MISSIONS: Mission[] = CHAPTERS.flatMap((c) => c.missions);

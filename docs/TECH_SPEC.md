@@ -292,8 +292,17 @@ builds all three platforms on native runners and drafts a release on `v*` tags.
 4. **Smoke:** `npm run web` server starts and serves the bundle.
 
 ## 9. Performance budgets
-Tick ≤ 1 ms for ≤ 100 pods; render ≤ 4 ms/frame; bundle ≤ 600 KB; memory ≤ 150 MB
+Tick ≤ 1 ms for ≤ 100 pods; render ≤ 4 ms/frame; bundle ≤ 1400 KB; memory ≤ 150 MB
 (renderer). No timers run while paused/briefing.
+
+**Bundle budget (raised 2026-11-22, 600 KB → 1400 KB).** The 600 KB figure was set for the MVP
+(14 missions, 12 resource kinds; 569 KB at v0.1.1). Covering curriculum stages 5–8 tripled the
+content (42 missions with lessons, insights and manifests: ~450 KB) and roughly doubled the engine
+(RBAC, admission, storage, autoscaling, network policy, routing, Kustomize, Helm, git, GitOps, CRDs:
+~710 KB). The unminified bundle is now ~1230 KB (~920 KB with `KQ_MINIFY=1`). It is loaded once from
+local disk (Electron) or a static host, still has zero runtime dependencies, and parses in well under
+100 ms, so the budget's purpose — no framework creep, fast start — holds. If it needs to shrink
+again, the lever is loading chapters on demand (`src/missions/chN.ts` are already separate modules).
 
 ## 10. Security
 No network, no `eval`, CSP `default-src 'self'`, Electron `sandbox: true`,

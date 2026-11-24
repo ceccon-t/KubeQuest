@@ -3,7 +3,9 @@ import type { Engine } from '../engine.ts';
 import type { Vfs } from '../vfs.ts';
 import type { KubectlCommand, OutputChunk, ShellHost, CommandContext } from './context.ts';
 import { err } from './context.ts';
-import { parseFlags, KubectlError, str, bool } from './args.ts';
+import { parseFlags, KubectlError, str, bool, strs } from './args.ts';
+import { ADMIN, userFor } from '../rbac.ts';
+import { formatApiError } from './api.ts';
 import { ApiError } from '../store.ts';
 import { ValidationError } from './validate.ts';
 import { KNOWN_UNSUPPORTED_COMMANDS, unsupported } from './unsupported.ts';
@@ -13,12 +15,14 @@ import { applyCommand, createCommand, editCommand } from './commands/apply.ts';
 import { runCommand, deleteCommand, scaleCommand, labelCommand, annotateCommand, exposeCommand } from './commands/imperative.ts';
 import { rolloutCommand, setCommand } from './commands/rollout.ts';
 import { logsCommand, execCommand, portForwardCommand } from './commands/logs.ts';
+import { authCommand, taintCommand, autoscaleCommand, patchCommand, debugCommand, kustomizeCommand } from './commands/extra.ts';
 import { configCommand, versionCommand, clusterInfoCommand, apiResourcesCommand, explainCommand, topCommand, waitCommand, cordonCommand, uncordonCommand, drainCommand, helpCommand } from './commands/misc.ts';
 
 export const COMMANDS: KubectlCommand[] = [
   getCommand, describeCommand, applyCommand, createCommand, editCommand, runCommand, deleteCommand, scaleCommand, labelCommand, annotateCommand,
   exposeCommand, rolloutCommand, setCommand, logsCommand, execCommand, portForwardCommand, configCommand, versionCommand, clusterInfoCommand,
   apiResourcesCommand, explainCommand, topCommand, waitCommand, cordonCommand, uncordonCommand, drainCommand, helpCommand,
+  authCommand, taintCommand, autoscaleCommand, patchCommand, debugCommand, kustomizeCommand,
 ];
 
 export function findCommand(name: string): KubectlCommand | undefined {
@@ -26,9 +30,10 @@ export function findCommand(name: string): KubectlCommand | undefined {
 }
 
 export async function* runKubectl(engine: Engine, vfs: Vfs, host: ShellHost, tokens: string[], cmdline: string, stdin?: string): AsyncGenerator<OutputChunk, number> {
+  engine.activate();
   const sub = tokens[0];
   if (!sub || sub === '--help' || sub === '-h') {
-    yield* helpCommand.run({ engine, vfs, host, args: { positional: [], flags: {}, rest: [] }, namespace: engine.currentNamespace, namespaceExplicit: false, allNamespaces: false, cmdline, stdin });
+    yield* helpCommand.run({ engine, vfs, host, args: { positional: [], flags: {}, rest: [] }, namespace: engine.currentNamespace, namespaceExplicit: false, allNamespaces: false, cmdline, stdin, user: ADMIN });
     return 0;
   }
   const cmd = findCommand(sub);
@@ -52,15 +57,16 @@ export async function* runKubectl(engine: Engine, vfs: Vfs, host: ShellHost, tok
       namespace: nsFlag ?? engine.currentNamespace,
       namespaceExplicit: nsFlag !== undefined,
       allNamespaces: bool(args, 'all-namespaces'),
+      user: userFor(str(args, 'as'), strs(args, 'as-group')),
     };
     return yield* cmd.run(ctx);
   } catch (e) {
     if (e instanceof KubectlError) {
-      const msg = e.message.startsWith('Error from server') || e.message.startsWith('kubequest:') ? e.message : `error: ${e.message}`;
+      const msg = /^(Error from server|kubequest:|The )/.test(e.message) ? e.message : `error: ${e.message}`;
       yield err(msg + '\n');
       return e.exitCode;
     }
-    if (e instanceof ApiError) { yield err(`Error from server (${e.reason}): ${e.message}\n`); return 1; }
+    if (e instanceof ApiError) { yield err(formatApiError(e) + '\n'); return 1; }
     if (e instanceof ValidationError) { yield err(`error: ${e.message}\n`); return 1; }
     throw e;
   }

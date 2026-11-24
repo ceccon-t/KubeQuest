@@ -79,7 +79,7 @@ web    3/3     3            3           12s
   r = await runLine(shell, host, 'kubectl get endpoints web');
   assert.match(r.stdout, /^NAME   ENDPOINTS\s+AGE\nweb    10\.244\.\d+\.\d+:80,10\.244\.\d+\.\d+:80,10\.244\.\d+\.\d+:80   1s\n$/);
   r = await runLine(shell, host, 'kubectl describe deploy web');
-  assert.match(r.stdout, /^Name:\s+web\nNamespace:\s+default\nCreationTimestamp:\s+\w{3}, \d{2} \w{3} 2026 \d{2}:\d{2}:\d{2} \+0000\nLabels:\s+app=web\nAnnotations:\s+deployment.kubernetes.io\/revision: 1\n\s+kubectl.kubernetes.io\/last-applied-configuration: \{.*\.\.\.\nSelector:\s+app=web\nReplicas:\s+3 desired \| 3 updated \| 3 total \| 3 available \| 0 unavailable\n/);
+  assert.match(r.stdout, /^Name:\s+web\nNamespace:\s+default\nCreationTimestamp:\s+\w{3}, \d{2} \w{3} 2026 \d{2}:\d{2}:\d{2} \+0000\nLabels:\s+app=web\nAnnotations:\s+deployment.kubernetes.io\/revision: 1\nSelector:\s+app=web\nReplicas:\s+3 desired \| 3 updated \| 3 total \| 3 available \| 0 unavailable\n/);
   assert.match(r.stdout, /Events:\n  Type    Reason             Age   From                   Message\n  ----    ------             ----  ----                   -------\n  Normal  ScalingReplicaSet  13s   deployment-controller  Scaled up replica set web-[a-z0-9]+ from 0 to 3\n$/);
   // rolling update under rollout status
   r = await runLine(shell, host, 'kubectl set image deployment/web web=nginx:1.25');
@@ -230,8 +230,14 @@ test('edit via editor, port-forward in background with curl, watch -w aborts cle
   assert.match(r.stdout, /Welcome to nginx/);
   r = await runLine(shell, host, 'curl -o out.html http://localhost:8080/');
   assert.equal(r.code, 0);
-  r = await runLine(shell, host, 'curl -s localhost:9999');
+  r = await runLine(shell, host, 'curl localhost:9999');
   assert.match(r.stderr, /curl: \(7\) Failed to connect to localhost port 9999/);
+  // like the real thing, -s silences the error message (the exit code still tells) unless -S is given
+  r = await runLine(shell, host, 'curl -s localhost:9999');
+  assert.equal(r.stderr, '');
+  assert.equal(r.code, 7);
+  r = await runLine(shell, host, 'curl -sS localhost:9999');
+  assert.match(r.stderr, /curl: \(7\)/);
   r = await runLine(shell, host, 'kill %1');
   assert.equal(r.code, 0);
   host.maxWaitMs = 3000;

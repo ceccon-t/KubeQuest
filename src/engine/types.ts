@@ -72,8 +72,10 @@ export interface Container {
   readinessProbe?: Probe;
   startupProbe?: Probe;
   volumeMounts?: { name: string; mountPath: string; readOnly?: boolean; subPath?: string }[];
-  securityContext?: Record<string, unknown>;
+  securityContext?: SecurityContext;
   workingDir?: string;
+  /** Ephemeral containers only: the container whose namespaces are shared (`kubectl debug --target`). */
+  targetContainerName?: string;
   terminationMessagePath?: string;
   terminationMessagePolicy?: string;
   tty?: boolean;
@@ -95,9 +97,32 @@ export interface Taint {
   timeAdded?: string;
 }
 
+export interface SecurityContext {
+  runAsUser?: number;
+  runAsGroup?: number;
+  runAsNonRoot?: boolean;
+  fsGroup?: number;
+  privileged?: boolean;
+  allowPrivilegeEscalation?: boolean;
+  readOnlyRootFilesystem?: boolean;
+  capabilities?: { add?: string[]; drop?: string[] };
+  seccompProfile?: { type?: string; localhostProfile?: string };
+  [extra: string]: unknown;
+}
+
+export interface TopologySpreadConstraint {
+  maxSkew: number;
+  topologyKey: string;
+  whenUnsatisfiable: 'DoNotSchedule' | 'ScheduleAnyway';
+  labelSelector?: LabelSelector;
+  matchLabelKeys?: string[];
+  minDomains?: number;
+}
+
 export interface Volume {
   name: string;
   emptyDir?: Record<string, unknown>;
+  projected?: Record<string, unknown>;
   configMap?: { name: string; items?: { key: string; path: string }[]; optional?: boolean };
   secret?: { secretName: string; items?: { key: string; path: string }[]; optional?: boolean };
   hostPath?: { path: string; type?: string };
@@ -115,13 +140,19 @@ export interface PodSpec {
   nodeSelector?: Record<string, string>;
   tolerations?: Toleration[];
   affinity?: Record<string, unknown>;
+  topologySpreadConstraints?: TopologySpreadConstraint[];
+  imagePullSecrets?: { name: string }[];
+  hostNetwork?: boolean;
+  hostPID?: boolean;
+  hostIPC?: boolean;
+  automountServiceAccountToken?: boolean;
   serviceAccountName?: string;
   serviceAccount?: string;
   dnsPolicy?: string;
   schedulerName?: string;
   priority?: number;
   priorityClassName?: string;
-  securityContext?: Record<string, unknown>;
+  securityContext?: SecurityContext;
   hostname?: string;
   subdomain?: string;
   enableServiceLinks?: boolean;
@@ -177,6 +208,7 @@ export interface PodStatus {
   startTime?: string;
   containerStatuses?: ContainerStatus[];
   initContainerStatuses?: ContainerStatus[];
+  ephemeralContainerStatuses?: ContainerStatus[];
   qosClass?: 'Guaranteed' | 'Burstable' | 'BestEffort';
   nominatedNodeName?: string;
 }
@@ -387,6 +419,169 @@ export interface Event extends KubeObject {
   type: 'Normal' | 'Warning';
   reportingComponent?: string;
   reportingInstance?: string;
+}
+
+export interface StatefulSet extends KubeObject {
+  kind: 'StatefulSet';
+  spec: {
+    replicas?: number;
+    serviceName: string;
+    selector: LabelSelector;
+    template: PodTemplateSpec;
+    volumeClaimTemplates?: PersistentVolumeClaim[];
+    podManagementPolicy?: 'OrderedReady' | 'Parallel';
+    updateStrategy?: { type?: 'RollingUpdate' | 'OnDelete'; rollingUpdate?: { partition?: number } };
+    revisionHistoryLimit?: number;
+    minReadySeconds?: number;
+    persistentVolumeClaimRetentionPolicy?: { whenDeleted?: string; whenScaled?: string };
+  };
+  status: {
+    replicas: number;
+    readyReplicas?: number;
+    availableReplicas?: number;
+    currentReplicas?: number;
+    updatedReplicas?: number;
+    currentRevision?: string;
+    updateRevision?: string;
+    observedGeneration?: number;
+    collisionCount?: number;
+  };
+}
+
+export interface PersistentVolumeClaim extends KubeObject {
+  kind: 'PersistentVolumeClaim';
+  spec: { accessModes?: string[]; resources?: { requests?: Record<string, string> }; storageClassName?: string; volumeName?: string; volumeMode?: string };
+  status?: { phase?: 'Pending' | 'Bound' | 'Lost'; accessModes?: string[]; capacity?: Record<string, string> };
+}
+
+export interface PersistentVolume extends KubeObject {
+  kind: 'PersistentVolume';
+  spec: {
+    capacity?: Record<string, string>;
+    accessModes?: string[];
+    persistentVolumeReclaimPolicy?: 'Delete' | 'Retain' | 'Recycle';
+    storageClassName?: string;
+    volumeMode?: string;
+    claimRef?: { kind: string; namespace: string; name: string; uid?: string; apiVersion?: string };
+    csi?: { driver: string; volumeHandle: string; fsType?: string };
+    hostPath?: { path: string };
+  };
+  status?: { phase?: 'Pending' | 'Available' | 'Bound' | 'Released' | 'Failed' };
+}
+
+export interface StorageClass extends KubeObject {
+  kind: 'StorageClass';
+  provisioner: string;
+  reclaimPolicy?: 'Delete' | 'Retain';
+  volumeBindingMode?: 'Immediate' | 'WaitForFirstConsumer';
+  allowVolumeExpansion?: boolean;
+  parameters?: Record<string, string>;
+}
+
+export interface IngressBackend { service?: { name: string; port?: { number?: number; name?: string } } }
+export interface Ingress extends KubeObject {
+  kind: 'Ingress';
+  spec: {
+    ingressClassName?: string;
+    defaultBackend?: IngressBackend;
+    tls?: { hosts?: string[]; secretName?: string }[];
+    rules?: { host?: string; http?: { paths: { path?: string; pathType: 'Prefix' | 'Exact' | 'ImplementationSpecific'; backend: IngressBackend }[] } }[];
+  };
+  status?: { loadBalancer?: { ingress?: { ip?: string; hostname?: string }[] } };
+}
+
+export interface NetworkPolicyPeer { podSelector?: LabelSelector; namespaceSelector?: LabelSelector; ipBlock?: { cidr: string; except?: string[] } }
+export interface NetworkPolicyPort { protocol?: string; port?: number | string; endPort?: number }
+export interface NetworkPolicy extends KubeObject {
+  kind: 'NetworkPolicy';
+  spec: {
+    podSelector: LabelSelector;
+    policyTypes?: ('Ingress' | 'Egress')[];
+    ingress?: { from?: NetworkPolicyPeer[]; ports?: NetworkPolicyPort[] }[];
+    egress?: { to?: NetworkPolicyPeer[]; ports?: NetworkPolicyPort[] }[];
+  };
+}
+
+export interface PolicyRule { apiGroups?: string[]; resources?: string[]; verbs: string[]; resourceNames?: string[]; nonResourceURLs?: string[] }
+export interface Role extends KubeObject { kind: 'Role' | 'ClusterRole'; rules?: PolicyRule[] }
+export interface RbacSubject { kind: 'User' | 'Group' | 'ServiceAccount'; name: string; namespace?: string; apiGroup?: string }
+export interface RoleBinding extends KubeObject {
+  kind: 'RoleBinding' | 'ClusterRoleBinding';
+  roleRef: { apiGroup?: string; kind: 'Role' | 'ClusterRole'; name: string };
+  subjects?: RbacSubject[];
+}
+
+export interface MetricSpec {
+  type: 'Resource' | 'Pods' | 'Object' | 'External' | 'ContainerResource';
+  resource?: { name: string; target: { type: 'Utilization' | 'AverageValue'; averageUtilization?: number; averageValue?: string } };
+  pods?: { metric: { name: string }; target: { type: 'AverageValue'; averageValue?: string } };
+}
+export interface HorizontalPodAutoscaler extends KubeObject {
+  kind: 'HorizontalPodAutoscaler';
+  spec: {
+    scaleTargetRef: { apiVersion?: string; kind: string; name: string };
+    minReplicas?: number;
+    maxReplicas: number;
+    metrics?: MetricSpec[];
+    behavior?: { scaleUp?: { stabilizationWindowSeconds?: number }; scaleDown?: { stabilizationWindowSeconds?: number } };
+  };
+  status: {
+    currentReplicas?: number;
+    desiredReplicas?: number;
+    lastScaleTime?: string;
+    currentMetrics?: { type: string; resource?: { name: string; current: { averageUtilization?: number; averageValue?: string } }; pods?: { metric: { name: string }; current: { averageValue?: string } } }[];
+    conditions?: Condition[];
+    observedGeneration?: number;
+  };
+}
+
+export interface PodDisruptionBudget extends KubeObject {
+  kind: 'PodDisruptionBudget';
+  spec: { minAvailable?: number | string; maxUnavailable?: number | string; selector?: LabelSelector };
+  status: { currentHealthy: number; desiredHealthy: number; disruptionsAllowed: number; expectedPods: number; observedGeneration?: number; conditions?: Condition[] };
+}
+
+export interface ResourceQuota extends KubeObject {
+  kind: 'ResourceQuota';
+  spec: { hard?: Record<string, string | number> };
+  status?: { hard?: Record<string, string>; used?: Record<string, string> };
+}
+
+export interface LimitRangeItem { type: 'Container' | 'Pod' | 'PersistentVolumeClaim'; max?: Record<string, string>; min?: Record<string, string>; default?: Record<string, string>; defaultRequest?: Record<string, string>; maxLimitRequestRatio?: Record<string, string> }
+export interface LimitRange extends KubeObject { kind: 'LimitRange'; spec: { limits: LimitRangeItem[] } }
+
+export interface PriorityClass extends KubeObject { kind: 'PriorityClass'; value: number; globalDefault?: boolean; preemptionPolicy?: string; description?: string }
+
+export interface CrdVersion {
+  name: string;
+  served?: boolean;
+  storage?: boolean;
+  schema?: { openAPIV3Schema?: JsonSchema };
+  additionalPrinterColumns?: { name: string; type: string; jsonPath: string; priority?: number; description?: string }[];
+  subresources?: Record<string, unknown>;
+}
+export interface JsonSchema {
+  type?: string;
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  items?: JsonSchema;
+  enum?: unknown[];
+  minimum?: number;
+  maximum?: number;
+  description?: string;
+  'x-kubernetes-preserve-unknown-fields'?: boolean;
+  additionalProperties?: JsonSchema | boolean;
+  [extra: string]: unknown;
+}
+export interface CustomResourceDefinition extends KubeObject {
+  kind: 'CustomResourceDefinition';
+  spec: {
+    group: string;
+    scope: 'Namespaced' | 'Cluster';
+    names: { kind: string; plural: string; singular?: string; shortNames?: string[]; categories?: string[]; listKind?: string };
+    versions: CrdVersion[];
+  };
+  status?: { conditions?: Condition[]; acceptedNames?: Record<string, unknown>; storedVersions?: string[] };
 }
 
 export type AnyObject = Pod | ReplicaSet | Deployment | DaemonSet | Job | CronJob | Service | Endpoints | Node | Namespace | ConfigMap | Secret | Event | KubeObject;

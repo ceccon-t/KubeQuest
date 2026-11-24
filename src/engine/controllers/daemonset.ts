@@ -1,10 +1,13 @@
 /** DaemonSet controller: one pod per eligible node; RollingUpdate on template change. */
 import type { Engine } from '../engine.ts';
+import { syncDue, syncFailed } from './requeue.ts';
 import type { DaemonSet, Pod, Node } from '../types.ts';
 import { applyDefaults } from '../defaults.ts';
 import { isPodReady, isPodAvailable } from './kubelet.ts';
 import { tolerates } from './scheduler.ts';
 import { sortKeys } from '../yaml.ts';
+import { admitPod } from '../admission.ts';
+import { ApiError } from '../store.ts';
 
 const DS_TOLERATIONS = [
   { key: 'node.kubernetes.io/not-ready', operator: 'Exists', effect: 'NoExecute' },
@@ -50,9 +53,18 @@ export function runDaemonSetController(engine: Engine): void {
         continue;
       }
       if (onNode.length === 0) {
+        const retryKey = `ds:${ds.metadata.uid}:${node.metadata.name}`;
+        if (!syncDue(engine, retryKey, ds)) continue;
         const pod = newDsPod(engine, ds, node, hash);
-        engine.store.create(pod);
-        engine.store.event({ type: 'Normal', reason: 'SuccessfulCreate', message: `Created pod: ${pod.metadata.name}`, involved: ds, component: 'daemonset-controller' });
+        try {
+          admitPod(engine, pod);
+          engine.store.create(pod);
+          engine.store.event({ type: 'Normal', reason: 'SuccessfulCreate', message: `Created pod: ${pod.metadata.name}`, involved: ds, component: 'daemonset-controller' });
+        } catch (e) {
+          if (!(e instanceof ApiError)) throw e;
+          engine.store.event({ type: 'Warning', reason: 'FailedCreate', message: `Error creating: ${e.message}`, involved: ds, component: 'daemonset-controller' });
+          syncFailed(engine, retryKey, ds);
+        }
         continue;
       }
       // keep one pod per node (delete extras)

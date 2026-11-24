@@ -80,6 +80,11 @@ function evalPath(path: string, roots: unknown[]): unknown[] {
   return cur;
 }
 
+/** First value a JSONPath selects in an object (CRD printer columns use only the first result). */
+export function jsonpathFirst(path: string, data: unknown): unknown {
+  try { return evalPath(path, [data])[0]; } catch { return undefined; }
+}
+
 function fmt(v: unknown): string {
   if (v === null || v === undefined) return '';
   if (typeof v === 'object') return JSON.stringify(v);

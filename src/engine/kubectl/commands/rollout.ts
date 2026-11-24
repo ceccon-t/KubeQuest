@@ -3,11 +3,13 @@ import { out, err } from '../context.ts';
 import { str, bool, strs, int, KubectlError } from '../args.ts';
 import { parseResourceArgs, fetch } from '../resources.ts';
 import { qualifiedName } from '../../registry.ts';
-import type { KubeObject, Deployment, ReplicaSet, DaemonSet, Container, ConfigMap, Pod, Job } from '../../types.ts';
+import type { KubeObject, Deployment, ReplicaSet, DaemonSet, StatefulSet, Container, ConfigMap, Pod, Job } from '../../types.ts';
 import { replicaSetsOf, revisionOf, rollbackTo, CHANGE_CAUSE_ANNOTATION, findNewReplicaSet } from '../../controllers/deployment.ts';
 import { tabwrite } from '../tabwriter.ts';
 import { parseGoDuration } from '../../duration.ts';
 import { describePodTemplateOnly } from './templ.ts';
+import { apiMutate, access, formatApiError, warningChunks } from '../api.ts';
+import { ApiError } from '../../store.ts';
 
 function deploymentArg(ctx: CommandContext, args: string[]): Deployment {
   const refs = parseResourceArgs(args);
@@ -17,7 +19,37 @@ function deploymentArg(ctx: CommandContext, args: string[]): Deployment {
     if (['DaemonSet', 'StatefulSet'].includes(ref.info.kind)) throw new KubectlError(`kubequest: rollout for ${ref.info.plural} is not supported in the simulator yet`);
     throw new KubectlError(`${ref.info.plural} "${ref.name}" is not a valid rollout target (no rollout strategy)`);
   }
-  return fetch(ctx.engine, ref, ctx.namespace, false)[0] as Deployment;
+  return fetch(ctx.engine, ref, ctx.namespace, false, undefined, undefined, access(ctx))[0] as Deployment;
+}
+
+/** Workloads with a rollout: Deployment, StatefulSet, DaemonSet. */
+function rolloutTarget(ctx: CommandContext, args: string[]): Deployment | StatefulSet | DaemonSet {
+  const refs = parseResourceArgs(args);
+  const ref = refs[0];
+  if (refs.length !== 1 || ref === undefined || ref.name === undefined) throw new KubectlError('required resource not specified');
+  if (!['Deployment', 'StatefulSet', 'DaemonSet'].includes(ref.info.kind)) throw new KubectlError(`${ref.info.plural} "${ref.name}" is not a valid rollout target (no rollout strategy)`);
+  return fetch(ctx.engine, ref, ctx.namespace, false, undefined, undefined, access(ctx))[0] as Deployment | StatefulSet | DaemonSet;
+}
+
+/** upstream: rollout_status.go StatefulSetStatusViewer / DaemonSetStatusViewer */
+function otherRolloutStatus(o: StatefulSet | DaemonSet): { msg: string; done: boolean } {
+  if (o.kind === 'StatefulSet') {
+    if ((o.spec.updateStrategy?.type ?? 'RollingUpdate') !== 'RollingUpdate') throw new KubectlError('rollout status is only available for RollingUpdate strategy type');
+    if ((o.metadata.generation ?? 0) > (o.status.observedGeneration ?? 0)) return { msg: 'Waiting for statefulset spec update to be observed...\n', done: false };
+    const replicas = o.spec.replicas ?? 1;
+    if ((o.status.readyReplicas ?? 0) < replicas) return { msg: `Waiting for ${replicas - (o.status.readyReplicas ?? 0)} pods to be ready...\n`, done: false };
+    // apps/v1 defaults rollingUpdate.partition to 0, so the partitioned messages are the ones users see
+    const partition = o.spec.updateStrategy?.rollingUpdate?.partition ?? 0;
+    const updated = o.status.updatedReplicas ?? 0;
+    if (updated < replicas - partition) return { msg: `Waiting for partitioned roll out to finish: ${updated} out of ${replicas - partition} new pods have been updated...\n`, done: false };
+    return { msg: `partitioned roll out complete: ${updated} new pods have been updated...\n`, done: true };
+  }
+  if ((o.spec.updateStrategy?.type ?? 'RollingUpdate') !== 'RollingUpdate') throw new KubectlError('rollout status is only available for RollingUpdate strategy type');
+  if ((o.metadata.generation ?? 0) > (o.status.observedGeneration ?? 0)) return { msg: 'Waiting for daemon set spec update to be observed...\n', done: false };
+  const desired = o.status.desiredNumberScheduled, updated = o.status.updatedNumberScheduled ?? 0, available = o.status.numberAvailable ?? 0;
+  if (updated < desired) return { msg: `Waiting for daemon set "${o.metadata.name}" rollout to finish: ${updated} out of ${desired} new pods have been updated...\n`, done: false };
+  if (available < desired) return { msg: `Waiting for daemon set "${o.metadata.name}" rollout to finish: ${available} of ${desired} updated pods are available...\n`, done: false };
+  return { msg: `daemon set "${o.metadata.name}" successfully rolled out\n`, done: true };
 }
 
 /** upstream: pkg/polymorphichelpers/rollout_status.go DeploymentStatusViewer */
@@ -61,7 +93,24 @@ export const rolloutCommand: KubectlCommand = {
     if (!sub) throw new KubectlError('You must specify a subcommand: history, pause, restart, resume, status, undo');
     switch (sub) {
       case 'status': {
-        const d0 = deploymentArg(ctx, rest);
+        const t0 = rolloutTarget(ctx, rest);
+        if (t0.kind !== 'Deployment') {
+          const timeoutFlag = str(a, 'timeout');
+          const timeout = timeoutFlag ? (parseGoDuration(timeoutFlag) ?? undefined) : undefined;
+          const start = ctx.engine.clock.nowMs;
+          let last = '';
+          while (true) {
+            const o = ctx.engine.store.get<StatefulSet | DaemonSet>(t0.kind, t0.metadata.namespace, t0.metadata.name);
+            if (!o) throw new KubectlError(`Error from server (NotFound): ${t0.kind.toLowerCase()}s.apps "${t0.metadata.name}" not found`);
+            const { msg, done } = otherRolloutStatus(o);
+            if (msg !== last) { yield out(msg); last = msg; }
+            if (done || !bool(a, 'watch')) return 0;
+            if (timeout !== undefined && timeout > 0 && ctx.engine.clock.nowMs - start >= timeout) { yield err('error: timed out waiting for the condition\n'); return 1; }
+            if (ctx.host.aborted()) return 130;
+            await ctx.host.sleep(250);
+          }
+        }
+        const d0 = t0 as Deployment;
         const timeout = str(a, 'timeout') ? (parseGoDuration(str(a, 'timeout')!) ?? undefined) : undefined;
         const start = ctx.engine.clock.nowMs;
         let last = '';
@@ -121,25 +170,23 @@ export const rolloutCommand: KubectlCommand = {
         return 0;
       }
       case 'restart': {
-        const d = deploymentArg(ctx, rest);
-        d.spec.template.metadata.annotations = { ...(d.spec.template.metadata.annotations ?? {}), 'kubectl.kubernetes.io/restartedAt': ctx.engine.clock.iso().replace('Z', '+00:00') };
-        ctx.engine.store.update(d, { specChanged: true });
-        yield out(`${qualifiedName('Deployment', d.metadata.name)} restarted\n`);
+        const d = rolloutTarget(ctx, rest);
+        const stamp = ctx.engine.clock.iso().replace(/\.\d+Z$/, 'Z').replace('Z', '+00:00');
+        yield* warningChunks(apiMutate(ctx, d, (x) => { x.spec.template.metadata.annotations = { ...(x.spec.template.metadata.annotations ?? {}), 'kubectl.kubernetes.io/restartedAt': stamp }; }, { specChanged: true }));
+        yield out(`${qualifiedName(d.kind, d.metadata.name)} restarted\n`);
         return 0;
       }
       case 'pause': {
         const d = deploymentArg(ctx, rest);
         if (d.spec.paused) throw new KubectlError('is already paused');
-        d.spec.paused = true;
-        ctx.engine.store.update(d, { specChanged: true });
+        apiMutate(ctx, d, (x) => { x.spec.paused = true; }, { specChanged: true });
         yield out(`${qualifiedName('Deployment', d.metadata.name)} paused\n`);
         return 0;
       }
       case 'resume': {
         const d = deploymentArg(ctx, rest);
         if (!d.spec.paused) throw new KubectlError('is not paused');
-        d.spec.paused = false;
-        ctx.engine.store.update(d, { specChanged: true });
+        apiMutate(ctx, d, (x) => { x.spec.paused = false; }, { specChanged: true });
         yield out(`${qualifiedName('Deployment', d.metadata.name)} resumed\n`);
         return 0;
       }
@@ -158,6 +205,7 @@ function templateOf(o: KubeObject): { containers: Container[]; initContainers?: 
     case 'Pod': return (o as Pod).spec;
     case 'Deployment': return (o as Deployment).spec.template.spec;
     case 'ReplicaSet': return (o as ReplicaSet).spec.template.spec;
+    case 'StatefulSet': return (o as unknown as Deployment).spec.template.spec;
     case 'DaemonSet': return (o as DaemonSet).spec.template.spec;
     case 'Job': return (o as Job).spec.template.spec;
     default: throw new KubectlError(`the object ${o.kind.toLowerCase()}s/${o.metadata.name} does not have a pod template`);
@@ -170,7 +218,7 @@ function setTargets(ctx: CommandContext, args: string[], all: boolean, selector:
   const objs: KubeObject[] = [];
   for (const r of refs) {
     if (r.name === undefined && !all && !selector) throw new KubectlError('resource(s) were provided, but no name was specified');
-    objs.push(...fetch(ctx.engine, r, ctx.namespace, false, selector));
+    objs.push(...fetch(ctx.engine, r, ctx.namespace, false, selector, undefined, access(ctx)));
   }
   return objs;
 }
@@ -204,12 +252,15 @@ export const setCommand: KubectlCommand = {
     const dry = str(a, 'dry-run');
     const isDry = !!dry && dry !== 'none';
     const record = bool(a, 'record');
-    const finish = (o: KubeObject, what: string): OutputChunk => {
+    // each subcommand edits a draft; `finish` sends it through admission and stores it
+    const warnings: string[] = [];
+    const finish = (live: KubeObject, draft: KubeObject, what: string): OutputChunk => {
       if (!isDry) {
-        if (record) o.metadata.annotations = { ...(o.metadata.annotations ?? {}), [CHANGE_CAUSE_ANNOTATION]: ctx.cmdline };
-        ctx.engine.store.update(o, { specChanged: true });
+        if (record) draft.metadata.annotations = { ...(draft.metadata.annotations ?? {}), [CHANGE_CAUSE_ANNOTATION]: ctx.cmdline };
+        try { warnings.push(...apiMutate(ctx, live, (d) => { for (const k of Object.keys(d)) delete (d as Record<string, unknown>)[k]; Object.assign(d, draft); }, { specChanged: true })); }
+        catch (e) { if (e instanceof ApiError) throw new KubectlError(formatApiError(e)); throw e; }
       }
-      return out(`${qualifiedName(o.kind, o.metadata.name)} ${what}${isDry ? ' (dry run)' : ''}\n`);
+      return out(`${qualifiedName(live.kind, live.metadata.name)} ${what}${isDry ? ' (dry run)' : ''}\n`);
     };
     switch (sub) {
       case 'image': {
@@ -218,7 +269,8 @@ export const setCommand: KubectlCommand = {
         if (!pairs.length) throw new KubectlError('at least one image update is required');
         const objs = setTargets(ctx, resArgs, bool(a, 'all'), str(a, 'selector'));
         const updates = pairs.map((p) => { const i = p.indexOf('='); return { name: p.slice(0, i), image: p.slice(i + 1) }; });
-        for (const o of objs) {
+        for (const live of objs) {
+          const o = structuredClone(live);
           const tpl = templateOf(o);
           const all = [...tpl.containers, ...(tpl.initContainers ?? [])];
           for (const u of updates) {
@@ -226,7 +278,9 @@ export const setCommand: KubectlCommand = {
             if (!matched.length) throw new KubectlError(`unable to find container named "${u.name}"`);
             for (const c of matched) c.image = u.image;
           }
-          yield finish(o, 'image updated');
+          const line = finish(live, o, 'image updated');
+          yield* warningChunks(warnings.splice(0));
+          yield line;
         }
         return 0;
       }
@@ -238,7 +292,8 @@ export const setCommand: KubectlCommand = {
         if (!pairs.length && !from && !bool(a, 'list')) throw new KubectlError('at least one environment variable must be provided');
         const objs = setTargets(ctx, resArgs, bool(a, 'all'), str(a, 'selector'));
         const cSel = str(a, 'containers') ?? '*';
-        for (const o of objs) {
+        for (const live of objs) {
+          const o = structuredClone(live);
           const tpl = templateOf(o);
           const targets = tpl.containers.filter((c) => cSel === '*' || c.name === cSel || (cSel.endsWith('*') && c.name.startsWith(cSel.slice(0, -1))));
           if (!targets.length) throw new KubectlError(`unable to find container named "${cSel}"`);
@@ -275,7 +330,9 @@ export const setCommand: KubectlCommand = {
             }
             if (env.length) c.env = env; else delete c.env;
           }
-          yield finish(o, 'env updated');
+          const line = finish(live, o, 'env updated');
+          yield* warningChunks(warnings.splice(0));
+          yield line;
         }
         return 0;
       }
@@ -285,7 +342,8 @@ export const setCommand: KubectlCommand = {
         if (!lim && !req) throw new KubectlError('you must specify an update to requests or limits (in the form of --requests/--limits)');
         const parse = (s: string | undefined) => (s ? Object.fromEntries(s.split(',').map((kv) => { const i = kv.indexOf('='); if (i <= 0) throw new KubectlError(`invalid resource "${kv}": must be key=value`); return [kv.slice(0, i), kv.slice(i + 1)]; })) : undefined);
         const cSel = str(a, 'containers') ?? '*';
-        for (const o of objs) {
+        for (const live of objs) {
+          const o = structuredClone(live);
           const tpl = templateOf(o);
           const targets = tpl.containers.filter((c) => cSel === '*' || c.name === cSel);
           if (!targets.length) throw new KubectlError(`unable to find container named "${cSel}"`);
@@ -295,7 +353,25 @@ export const setCommand: KubectlCommand = {
             if (l) c.resources.limits = { ...(c.resources.limits ?? {}), ...l };
             if (r) c.resources.requests = { ...(c.resources.requests ?? {}), ...r };
           }
-          yield finish(o, 'resource requirements updated');
+          const line = finish(live, o, 'resource requirements updated');
+          yield* warningChunks(warnings.splice(0));
+          yield line;
+        }
+        return 0;
+      }
+      case 'serviceaccount': case 'sa': {
+        const pos = a.positional.slice(1);
+        const name = pos[pos.length - 1];
+        if (pos.length < 2 || !name) throw new KubectlError('serviceaccount is required');
+        const objs = setTargets(ctx, pos.slice(0, -1), bool(a, 'all'), str(a, 'selector'));
+        for (const live of objs) {
+          const o = structuredClone(live);
+          const tpl = templateOf(o) as { serviceAccountName?: string; serviceAccount?: string };
+          tpl.serviceAccountName = name;
+          tpl.serviceAccount = name;
+          const line = finish(live, o, 'serviceaccount updated');
+          yield* warningChunks(warnings.splice(0));
+          yield line;
         }
         return 0;
       }
